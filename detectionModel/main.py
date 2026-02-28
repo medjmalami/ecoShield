@@ -1,10 +1,41 @@
+import sys
 import joblib
 import numpy as np
 import torch
+import torch.nn as nn
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
 
 app = FastAPI(title="EcoShield Detection Model")
+
+# ── Model class definition (required for torch.load with full model object) ───
+
+class LSTMAnomalyClassifier(nn.Module):
+    def __init__(self, input_dim=30, hidden_size=64, num_layers=1, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last_h = out[:, -1, :]
+        logits = self.fc(self.dropout(last_h)).squeeze(1)
+        return logits
+
+
+# ── Register class in __main__ so torch.load can find it ─────────────────────
+# The .pt file was saved with torch.save(model, ...) which pickles the class
+# reference as __main__.LSTMAnomalyClassifier. When running under uvicorn,
+# __main__ is uvicorn's entry point, not this file. This trick fixes it.
+sys.modules["__main__"].LSTMAnomalyClassifier = LSTMAnomalyClassifier
+
 
 # ── Load model and scaler at startup ─────────────────────────────────────────
 
@@ -58,15 +89,15 @@ def predict(payload: list[list[float]]) -> dict:
                 detail=f"Frame {i}: expected 30 floats (5 sensors × 6 features), got {len(row)}",
             )
 
-    # Scale input: reshape (5, 30) → (25, 6), scale, reshape back to (5, 30)
+    # Scale input: reshape (5, 30) → (25, 6), scale, reshape back to (1, 5, 30)
     arr = np.array(payload, dtype=np.float32).reshape(25, 6)
-    arr_scaled = scaler.transform(arr).reshape(5, 30)
+    arr_scaled = scaler.transform(arr).reshape(1, 5, 30).astype(np.float32)
 
-    # shape: (1, 5, 30) — batch of 1
-    x = torch.tensor([arr_scaled], dtype=torch.float32)
+    # Convert to tensor — batch of 1
+    x = torch.from_numpy(arr_scaled)
 
     with torch.no_grad():
         logits = model(x)
         prob = torch.sigmoid(logits).item()
 
-    return {"anomaly_detected": prob >= 0.5}
+    return {"anomaly_detected": prob >= 0.9}
