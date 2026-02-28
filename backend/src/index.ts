@@ -1,7 +1,10 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import "./lib/mongo";
 import { runPipeline } from "./lib/pipeline";
+import eventsRouter from "./routes/events";
+import detectionsRouter from "./routes/detections";
 
 dotenv.config();
 
@@ -14,6 +17,9 @@ app.use(express.json());
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+app.use("/events", eventsRouter);
+app.use("/detections", detectionsRouter);
 
 app.listen(PORT, () => {
   console.log(`[server] running on port ${PORT}`);

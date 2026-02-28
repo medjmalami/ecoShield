@@ -48,5 +48,5 @@ def predict(payload: list[list[SensorDataBatch]]) -> DetectionOutput:
             detail="Expected exactly 5 sensorGroups each with 5 SensorDataBatch readings",
         )
 
-    anomaly = random.random() < 0.10  # 10% attack rate
+    anomaly = random.random() < 0.50  # 10% attack rate
     return DetectionOutput(anomaly_detected=anomaly)

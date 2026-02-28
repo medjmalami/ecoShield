@@ -2,24 +2,29 @@
 
 import { useEffect, useState } from 'react';
 
-interface Alert {
-  sensorId: string;
-  score: number;
-}
-
 interface AlertBannerProps {
-  alert: Alert;
+  detectedAt: string;
 }
 
-export default function AlertBanner({ alert }: AlertBannerProps) {
+function formatDate(iso: string): string {
+  return new Date(iso).toLocaleString('fr-FR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+export default function AlertBanner({ detectedAt }: AlertBannerProps) {
   const [show, setShow] = useState(true);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setShow(false);
-    }, 3000);
+    setShow(true);
+    const timer = setTimeout(() => setShow(false), 3000);
     return () => clearTimeout(timer);
-  }, [alert]);
+  }, [detectedAt]);
 
   if (!show) return null;
 
@@ -27,10 +32,7 @@ export default function AlertBanner({ alert }: AlertBannerProps) {
     <div className="w-full bg-[#ff4444] py-4 px-6 animate-in slide-in-from-top duration-300">
       <div className="text-center font-bold text-white text-lg flex items-center justify-center gap-2">
         <span>🔴</span>
-        <span>ATTAQUE DÉTECTÉE ET BLOQUÉE — Capteur {alert.sensorId}</span>
-        <span className="ml-4 text-sm bg-black/20 px-3 py-1 rounded">
-          Score: {alert.score}%
-        </span>
+        <span>ANOMALIE FDI DÉTECTÉE — {formatDate(detectedAt)}</span>
       </div>
     </div>
   );

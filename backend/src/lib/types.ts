@@ -62,3 +62,10 @@ export type detectionInput = [
 export type detectionOutput = {
     anomaly_detected: boolean,
 }
+
+export type PipelineEvent = {
+    timestamp: string;
+    anomaly: { detected: false } | { detected: true; sensorWindow: sensorDataBatch[][] };
+    sensor5: { pump_power: number };
+    optimizer: { pump_power_optimized: number };
+}
