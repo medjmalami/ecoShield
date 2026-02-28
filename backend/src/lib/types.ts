@@ -7,17 +7,6 @@ export type sensorData = {
     pump_power: number
 }
 
-export type processedSensorData = {
-    id: string,
-    timestamp: string,
-    pressure: number,
-    flow_rate: number,
-    temperature: number,
-    pump_power: number,
-    time_of_day: string,
-    day_of_week: string,
-    month: string,
-}
 export type sensorDataBatch = {
     id: string,
     timestamp: string,
@@ -25,9 +14,6 @@ export type sensorDataBatch = {
     flow_rate: number,
     temperature: number,
     pump_power: number,
-    time_of_day: string,
-    day_of_week: string,
-    month: string,
     pressure_mean: number,
     pressure_var: number,
 }
@@ -39,25 +25,19 @@ export type sensorGroup =  [
     sensorDataBatch,
 ]
 
-export type optimizerInput = [
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-]
+// Shape sent to the optimizer: (5 frames × 30 floats)
+// Each row = 5 sensors × 6 features [pressure, flow_rate, temperature, pump_power, pressure_mean, pressure_var]
+// sorted by sensor id ascending
+export type optimizerInput = number[][]
 
 export type optimizerOutput = {
     pump_power_optimized: number,
 }
 
-export type detectionInput = [
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-    sensorGroup,
-]
+// Shape sent to the detection model: (5 frames × 30 floats)
+// Each row = 5 sensors × 6 features [pressure, flow_rate, temperature, pump_power, pressure_mean, pressure_var]
+// sorted by sensor id ascending — identical shape to optimizerInput
+export type detectionInput = number[][]
 
 export type detectionOutput = {
     anomaly_detected: boolean,
