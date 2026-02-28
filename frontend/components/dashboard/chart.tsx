@@ -16,7 +16,7 @@ export default function Chart({ data }: ChartProps) {
 
       <div className="bg-slate-900/30 rounded-lg p-6 border border-slate-800">
         {data.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-[400px] text-center">
+          <div className="flex flex-col items-center justify-center h-100 text-center">
             <div className="text-4xl mb-2">📡</div>
             <div className="text-slate-400 font-medium">En attente des données du capteur...</div>
             <div className="text-slate-500 text-sm mt-1">Le graphique s&apos;affichera dès la première mesure</div>
