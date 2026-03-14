@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+# Build output
+dist/
+.next/
+# Environment files
+.env
+.env.local
+.env*.local
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+# Misc
+.DS_Store
+*.tsbuildinfo

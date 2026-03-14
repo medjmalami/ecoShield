@@ -27,9 +27,22 @@ services:
     networks:
       - ecoshield_net
 
+  rabbitmq:
+    image: rabbitmq:3.10.5-management
+    container_name: ecoshield_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - ecoshield_net
+
 volumes:
   mongo_data:
   redis_data:
+  rabbitmq_data:
 
 networks:
   ecoshield_net:

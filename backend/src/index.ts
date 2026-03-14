@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import "./lib/mongo";
-import { runPipeline } from "./lib/pipeline";
+import { startConsumer } from "./lib/pipeline";
 import eventsRouter from "./routes/events";
 import detectionsRouter from "./routes/detections";
 
@@ -24,9 +24,8 @@ app.use("/detections", detectionsRouter);
 app.listen(PORT, () => {
   console.log(`[server] running on port ${PORT}`);
 
-  // Run immediately on startup, then every 5 seconds
-  runPipeline();
-  setInterval(runPipeline, 5000);
+  // Start consuming sensor ticks from RabbitMQ
+  startConsumer();
 });
 
 export default app;
