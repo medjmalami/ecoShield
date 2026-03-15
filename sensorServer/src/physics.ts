@@ -37,11 +37,11 @@ function demandProfile(hourFloat: number): number {
 }
 
 // ── Generate 5 sensorData objects using physics model ────────────────────────
+// `now` is the shared physics base time for this tick, supplied by the caller.
+// The caller is responsible for stamping each reading's .timestamp individually
+// (with per-sensor jitter applied after this function returns).
 
-export function generateSensorData(): sensorData[] {
-  const now = new Date();
-  const timestamp = now.toISOString();
-
+export function generateSensorData(now: Date): sensorData[] {
   // ── Time features ───────────────────────────────────────────────────────────
   const hourFloat = now.getHours() + now.getMinutes() / 60 + now.getSeconds() / 3600;
   const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
@@ -164,7 +164,7 @@ export function generateSensorData(): sensorData[] {
 
     return {
       id: String(i + 1),
-      timestamp,
+      timestamp: "",  // caller stamps each sensor individually with per-sensor jitter
       pressure: parseFloat(pressure.toFixed(6)),
       flow_rate: parseFloat(flowRate.toFixed(6)),
       temperature: parseFloat(temperature.toFixed(6)),
