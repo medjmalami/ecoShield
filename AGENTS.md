@@ -39,6 +39,14 @@ npm run build   # Compile TypeScript → dist/
 npm start       # Run the compiled JS from dist/index.js
 ```
 
+**One-time setup:** after configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, seed the sensor registry:
+
+```bash
+npx ts-node scripts/seedSensors.ts
+```
+
+This encrypts each `SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` and upserts 5 `Sensor` documents into MongoDB. Only needs to be run once (or after rotating sensor keys).
+
 ### SensorServer (`sensorServer/` — npm)
 
 ```bash
@@ -233,8 +241,9 @@ These are load-bearing design decisions — do not change without understanding 
   `SENSOR_<N>_SECRET_KEY` in `sensorServer/.env`, then restarting both services.
 
 - **Sensor registry:** a `Sensor` Mongoose model (`backend/src/lib/models/sensor.ts`) stores
-  `{ id, name, location, encryptedSecretKey, active, registeredAt }`. Exposed read-only via `GET /sensors`
-  — the response always strips `encryptedSecretKey`. The in-memory cache built at startup is the auth source
+  `{ id, name, location, encryptedSecretKey, active, registeredAt }`. Use `backend/scripts/seedSensors.ts`
+  (run once: `npx ts-node scripts/seedSensors.ts`) to encrypt and insert all 5 sensor documents — requires
+  `MASTER_KEY` and `MONGO_URI` in `backend/.env`. The in-memory cache built at startup is the auth source
   of truth during runtime; the DB is not queried per message.
 
 - **Timestamp drift simulation:** `sensorServer` applies an independent random jitter of ±`MAX_DRIFT_MS` to
@@ -244,31 +253,39 @@ These are load-bearing design decisions — do not change without understanding 
 
 - **Redis bucket buffer:** incoming sensor readings are grouped into time buckets. The incoming timestamp is
   rounded to the nearest `TICK_INTERVAL_MS` boundary:
-  `Math.round(ts / TICK_INTERVAL_MS) * TICK_INTERVAL_MS`. Three Redis structures are used:
-  - `sensor:tick:<rounded-ts>` — Redis Hash `{ sensorId → sensorData json }`. TTL = `BUCKET_DEADLINE_MS × 2`
-    (auto-cleans incomplete buckets without any application-level cleanup code).
-  - `sensor:ticks:complete` — Redis Sorted Set of closed bucket timestamps (score = epoch ms). A bucket is
-    added here when it either reaches 5 sensors naturally or its deadline fires with imputation applied.
+  `Math.round(ts / TICK_INTERVAL_MS) * TICK_INTERVAL_MS`. Four Redis structures are used:
   - `sensor:last:<id>` — Redis String holding the most recent valid reading per sensor. Updated on every
     successfully authenticated message regardless of bucket state. Used for last-known-value imputation.
+    Never deleted — preserved across backend restarts.
+  - `sensor:tick:<rounded-ts>` — Redis Hash `{ sensorId → sensorData json }`. TTL = `TICK_INTERVAL_MS ×
+    BUFFER_SIZE × 3` (75s, auto-cleans incomplete buckets). Explicitly DEL'd by `assembleAndPushBatch()`
+    immediately after the batch is assembled — it is never read again after that point.
+  - `sensor:closing:<rounded-ts>` — Redis String NX lock (TTL = 30s). Set atomically before assembling a
+    bucket. Prevents double-close races where both `processSensorMessage` (full bucket) and `onDeadline`
+    (deadline fired) attempt to assemble the same bucket concurrently.
+  - `sensor:ticks:complete` — Redis **List** of fully-assembled `sensorGroup` JSON strings (oldest at head,
+    newest at tail). A batch is appended (`RPUSH`) when a bucket closes. The list always holds the last 4
+    complete batches after each pipeline run. DEL'd on backend startup to clear any stale state from the
+    previous session.
 
 - **Bucket deadline and imputation:** when the first reading for a bucket arrives, a `setTimeout` of
-  `BUCKET_DEADLINE_MS` is registered in the `deadlineTimers: Map<string, NodeJS.Timeout>` in `pipeline.ts`.
+  `BUCKET_DEADLINE_MS` is registered in the `deadlineTimers: Map<number, NodeJS.Timeout>` in `pipeline.ts`.
   If all 5 sensors report before the deadline, the timer is cancelled and the bucket is immediately closed.
   If the deadline fires with fewer than 5 sensors: each missing sensor is substituted with its
-  `sensor:last:<id>` value. `pressure_mean` and `pressure_var` are computed from only the sensors that
-  actually reported real readings — not from imputed values — then assigned to all sensors in the bucket
-  including imputed ones. If a sensor has no last-known value (it has never reported since backend startup),
-  the bucket is dropped entirely and a warning is logged — the pipeline does not run for that window.
-  Imputation uses real physics readings from the previous tick, not zeros or synthetic values, so the model
-  input shape `(5, 30)` is always preserved.
+  `sensor:last:<id>` value. `pressure_mean` and `pressure_var` are computed from all 5 sensors in the
+  bucket, including imputed ones. If a sensor has no last-known value (it has never reported since backend
+  startup), the bucket is dropped entirely and a warning is logged — the pipeline does not run for that
+  window. Imputation uses real physics readings from the previous tick, not zeros or synthetic values, so
+  the model input shape `(5, 30)` is always preserved.
 
-- **Pipeline trigger:** the pipeline fires when `sensor:ticks:complete` contains ≥ 5 members. It reads the
-  5 oldest complete bucket timestamps from the sorted set, fetches their hash data from Redis, reconstructs
-  the `(5 frames × 30 floats)` payload via `buildModelPayload()` (sensors sorted by id ascending, 6 features
-  each: `pressure, flow_rate, temperature, pump_power, pressure_mean, pressure_var`), then removes the oldest
-  entry from the sorted set to slide the window. `BUFFER_SIZE = 5` complete buckets, `SENSOR_COUNT = 5`
-  sensors per bucket, total model input = 25 readings.
+- **Pipeline trigger (sliding window):** the pipeline fires when `LLEN("sensor:ticks:complete") = 5`. It
+  reads exactly 5 batches via `LRANGE 0 4` (the fully-assembled `sensorGroup` JSON strings — no hash
+  lookups at pipeline time), then immediately `LPOP`s the oldest entry so the list returns to 4. It
+  reconstructs the `(5 frames × 30 floats)` payload via `buildModelPayload()` (sensors sorted by id
+  ascending, 6 features each: `pressure, flow_rate, temperature, pump_power, pressure_mean,
+  pressure_var`). After the 4-tick warm-up, the pipeline fires on every tick (~5s), producing one SSE
+  event per tick to the frontend. `BUFFER_SIZE = 5` complete buckets, `SENSOR_COUNT = 5` sensors per
+  bucket, total model input = 25 readings.
 
 - **Shared model input shape:** both LSTM models accept exactly `(5 frames × 30 floats)`. The
   `buildModelPayload()` function constructs this. Any model retrain must preserve `SEQ_LEN = 5`,
