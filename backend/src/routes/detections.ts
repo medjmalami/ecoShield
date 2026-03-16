@@ -5,13 +5,17 @@ const router = Router();
 
 router.get("/", async (req: Request, res: Response) => {
   try {
-    const page  = Math.max(1, parseInt(req.query.page  as string) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 10));
-    const skip  = (page - 1) * limit;
+    const page     = Math.max(1, parseInt(req.query.page  as string) || 1);
+    const limit    = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 10));
+    const skip     = (page - 1) * limit;
+    const location = req.query.location as string | undefined;
+
+    // Build an optional location filter — if omitted, all locations are returned
+    const filter = location ? { location } : {};
 
     const [total, data] = await Promise.all([
-      FlaggedEvent.countDocuments(),
-      FlaggedEvent.find()
+      FlaggedEvent.countDocuments(filter),
+      FlaggedEvent.find(filter)
         .sort({ detectedAt: -1 })
         .skip(skip)
         .limit(limit)

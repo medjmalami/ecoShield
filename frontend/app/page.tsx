@@ -10,6 +10,8 @@ import type { FlaggedEvent, DetectionsResponse, ChartDataPoint } from '@/lib/api
 
 const MAX_CHART_POINTS = 30;
 
+type Location = 'locationA' | 'locationB';
+
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString('fr-FR', {
     hour: '2-digit',
@@ -19,30 +21,43 @@ function formatTime(iso: string): string {
 }
 
 export default function Home() {
-  // Chart — rolling 30-point buffer
-  const [chartData, setChartData] = useState<ChartDataPoint[]>([]);
+  // ── Location selection ────────────────────────────────────────────────────
+  const [selectedLocation, setSelectedLocation] = useState<Location>('locationA');
 
-  // Navbar stats
-  const [energySaved, setEnergySaved] = useState<number>(0);
-  const [attacksBlocked, setAttacksBlocked] = useState<number>(0);
+  // ── Chart — independent rolling 30-point buffers per location ────────────
+  const [chartData, setChartData] = useState<Record<Location, ChartDataPoint[]>>({
+    locationA: [],
+    locationB: [],
+  });
 
-  // Alert banner — ISO timestamp of the latest anomaly, null = no active banner
+  // ── Navbar stats — independent per location ───────────────────────────────
+  const [energySaved, setEnergySaved] = useState<Record<Location, number>>({
+    locationA: 0,
+    locationB: 0,
+  });
+  const [attacksBlocked, setAttacksBlocked] = useState<Record<Location, number>>({
+    locationA: 0,
+    locationB: 0,
+  });
+
+  // ── Alert banner — ISO timestamp of the latest anomaly (either location) ──
   const [latestAnomaly, setLatestAnomaly] = useState<string | null>(null);
 
-  // Attack log — server-driven pagination
+  // ── Attack log — server-driven pagination, scoped to selectedLocation ─────
   const [detections, setDetections] = useState<FlaggedEvent[]>([]);
   const [detPage, setDetPage] = useState<number>(1);
   const [detPagination, setDetPagination] = useState<DetectionsResponse['pagination'] | null>(null);
   const [detLoading, setDetLoading] = useState<boolean>(true);
 
-  // ── REST: fetch detections whenever page changes ──────────────────────────
-  const loadDetections = useCallback(async (page: number) => {
+  // ── REST: fetch detections for the active location ────────────────────────
+  const loadDetections = useCallback(async (page: number, location: Location) => {
     setDetLoading(true);
     try {
-      const res = await fetchDetections(page, 10);
+      const res = await fetchDetections(page, 10, location);
       setDetections(res.data);
       setDetPagination(res.pagination);
-      setAttacksBlocked(res.pagination.total);
+      // Keep attacksBlocked in sync with the DB total for this location
+      setAttacksBlocked((prev) => ({ ...prev, [location]: res.pagination.total }));
     } catch (err) {
       console.error('[page] fetchDetections error:', err);
     } finally {
@@ -50,48 +65,67 @@ export default function Home() {
     }
   }, []);
 
+  // Reload detections whenever page or selected location changes
   useEffect(() => {
-    loadDetections(detPage);
-  }, [detPage, loadDetections]);
+    loadDetections(detPage, selectedLocation);
+  }, [detPage, selectedLocation, loadDetections]);
 
-  // ── SSE: subscribe once on mount ──────────────────────────────────────────
+  // Reset to page 1 when switching locations
+  const handleLocationChange = useCallback((loc: Location) => {
+    setSelectedLocation(loc);
+    setDetPage(1);
+  }, []);
+
+  // ── SSE: subscribe once on mount, route events by location ───────────────
   useEffect(() => {
     const unsubscribe = subscribeToEvents((event) => {
+      const loc       = event.location as Location;
       const real      = event.sensor5.pump_power;
       const optimized = event.optimizer.pump_power_optimized;
 
-      // 1. Append to rolling chart buffer
+      // 1. Append to the correct location's rolling chart buffer
       setChartData((prev) => {
         const next: ChartDataPoint = {
-          time: formatTime(event.timestamp),
+          time:      formatTime(event.timestamp),
           real:      parseFloat(real.toFixed(2)),
           optimized: parseFloat(optimized.toFixed(2)),
         };
-        const updated = [...prev, next];
-        return updated.length > MAX_CHART_POINTS
-          ? updated.slice(updated.length - MAX_CHART_POINTS)
-          : updated;
+        const updated = [...prev[loc], next];
+        return {
+          ...prev,
+          [loc]: updated.length > MAX_CHART_POINTS
+            ? updated.slice(updated.length - MAX_CHART_POINTS)
+            : updated,
+        };
       });
 
-      // 2. Recompute energySaved from this tick
+      // 2. Recompute energySaved for this location
       if (real > 0) {
         const pct = Math.round(((real - optimized) / real) * 100);
-        setEnergySaved(pct);
+        setEnergySaved((prev) => ({ ...prev, [loc]: pct }));
       }
 
-      // 3. If anomaly detected — show banner and refresh detections from page 1
+      // 3. If anomaly detected — show banner and refresh detections if it's the active location
       if (event.anomaly.detected) {
         setLatestAnomaly(event.timestamp);
-        setDetPage(1);
-        // If already on page 1, detPage won't change so force a reload
-        loadDetections(1);
+        if (loc === selectedLocation) {
+          setDetPage(1);
+          loadDetections(1, loc);
+        } else {
+          // Still update the attacksBlocked count for the other location in the background
+          fetchDetections(1, 10, loc)
+            .then((res) => {
+              setAttacksBlocked((prev) => ({ ...prev, [loc]: res.pagination.total }));
+            })
+            .catch((err) => console.error('[page] background fetchDetections error:', err));
+        }
       }
     });
 
     return unsubscribe;
-  }, [loadDetections]);
+  }, [loadDetections, selectedLocation]);
 
-  // ── Handle page change from AttackLog ────────────────────────────────────
+  // ── Handle page change from AttackLog ─────────────────────────────────────
   const handlePageChange = useCallback((page: number) => {
     setDetPage(page);
   }, []);
@@ -101,10 +135,17 @@ export default function Home() {
       {latestAnomaly && (
         <AlertBanner key={latestAnomaly} detectedAt={latestAnomaly} />
       )}
-      <Navbar energySaved={energySaved} attacksBlocked={attacksBlocked} />
+      <Navbar
+        energySaved={energySaved[selectedLocation]}
+        attacksBlocked={attacksBlocked[selectedLocation]}
+      />
       <div className="p-6">
         <div className="mb-8">
-          <Chart data={chartData} />
+          <Chart
+            data={chartData[selectedLocation]}
+            selectedLocation={selectedLocation}
+            onLocationChange={handleLocationChange}
+          />
         </div>
         <div>
           <AttackLog

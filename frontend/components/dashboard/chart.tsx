@@ -1,17 +1,47 @@
 'use client';
 
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { cn } from '@/lib/utils';
 import type { ChartDataPoint } from '@/lib/api';
+
+type Location = 'locationA' | 'locationB';
 
 interface ChartProps {
   data: ChartDataPoint[];
+  selectedLocation: Location;
+  onLocationChange: (loc: Location) => void;
 }
 
-export default function Chart({ data }: ChartProps) {
+const LOCATION_LABELS: Record<Location, string> = {
+  locationA: 'Location A',
+  locationB: 'Location B',
+};
+
+export default function Chart({ data, selectedLocation, onLocationChange }: ChartProps) {
   return (
     <div className="space-y-4">
-      <div>
-        <h2 className="text-lg font-semibold text-white mb-1">Puissance réelle vs optimisée en temps réel</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold text-white">
+          Puissance réelle vs optimisée en temps réel
+        </h2>
+
+        {/* Location toggle buttons */}
+        <div className="flex gap-2">
+          {(Object.keys(LOCATION_LABELS) as Location[]).map((loc) => (
+            <button
+              key={loc}
+              onClick={() => onLocationChange(loc)}
+              className={cn(
+                'px-4 py-1.5 rounded-md text-sm font-medium border transition-colors',
+                selectedLocation === loc
+                  ? 'border-[#00ff88] text-[#00ff88] bg-[#00ff88]/10'
+                  : 'border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-300'
+              )}
+            >
+              {LOCATION_LABELS[loc]}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="bg-slate-900/30 rounded-lg p-6 border border-slate-800">
@@ -19,7 +49,9 @@ export default function Chart({ data }: ChartProps) {
           <div className="flex flex-col items-center justify-center h-100 text-center">
             <div className="text-4xl mb-2">📡</div>
             <div className="text-slate-400 font-medium">En attente des données du capteur...</div>
-            <div className="text-slate-500 text-sm mt-1">Le graphique s&apos;affichera dès la première mesure</div>
+            <div className="text-slate-500 text-sm mt-1">
+              Le graphique s&apos;affichera dès la première mesure
+            </div>
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={400}>

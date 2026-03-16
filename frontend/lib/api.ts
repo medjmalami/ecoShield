@@ -19,6 +19,7 @@ export type SensorDataBatch = {
 export type FlaggedEvent = {
   _id: string;
   detectedAt: string;
+  location: string;
   detectionResult: { anomaly_detected: boolean };
   sensorWindow: SensorDataBatch[][];
 };
@@ -41,6 +42,7 @@ export type ChartDataPoint = {
 
 export type PipelineEvent = {
   timestamp: string;
+  location: string;
   anomaly: { detected: false } | { detected: true; sensorWindow: SensorDataBatch[][] };
   sensor5: { pump_power: number };
   optimizer: { pump_power_optimized: number };
@@ -50,12 +52,12 @@ export type PipelineEvent = {
 
 export async function fetchDetections(
   page: number = 1,
-  limit: number = 10
+  limit: number = 10,
+  location?: string
 ): Promise<DetectionsResponse> {
-  const res = await fetch(
-    `${API_URL}/detections?page=${page}&limit=${limit}`,
-    { cache: 'no-store' }
-  );
+  const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+  if (location) params.set('location', location);
+  const res = await fetch(`${API_URL}/detections?${params.toString()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`[api] fetchDetections failed: ${res.status}`);
   return res.json();
 }
