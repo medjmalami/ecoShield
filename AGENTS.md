@@ -39,15 +39,23 @@ npm run build   # Compile TypeScript → dist/
 npm start       # Run the compiled JS from dist/index.js
 ```
 
-**One-time setup:** after configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, seed the sensor registry:
+**One-time setup — sensor registry:** after configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, the 10 `Sensor` documents must be inserted into MongoDB manually (or via a private, out-of-band script that is **never committed to source control**). Each document requires:
 
-```bash
-npx ts-node scripts/seedSensors.ts
+```json
+{
+  "id": "<uuid>",
+  "name": "Sensor N",
+  "location": "locationA | locationB",
+  "encryptedSecretKey": "<iv_hex>:<ciphertext_hex>",
+  "active": true
+}
 ```
 
-This encrypts each `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` and upserts **10 `Sensor` documents** into MongoDB (5 for `locationA`, 5 for `locationB`, all with UUID `id` fields). It also deletes any legacy sequential-ID documents (`"1"`–`"10"`) left from earlier versions. Only needs to be run once (or after rotating sensor keys).
+Encrypt each plaintext key with AES-256-CBC using `MASTER_KEY` (see `decryptKey()` in `backend/src/lib/pipeline.ts` for the format). The UUIDs and their corresponding `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` env vars in `sensorServer/.env` are the authoritative source — they must match the `id` and `encryptedSecretKey` fields in MongoDB.
 
-A second utility script is available for maintenance:
+> **Security note:** `backend/scripts/seedSensors.ts` has been removed because it embedded all 10 plaintext sensor secret keys directly in source code. If you have a copy of the repository from before this change, assume those keys are compromised and rotate them (generate new 32-byte hex secrets, update `sensorServer/.env`, re-encrypt and update MongoDB, restart both services).
+
+A utility script is available for maintenance:
 
 ```bash
 npx ts-node scripts/clearDetections.ts
@@ -261,10 +269,9 @@ These are load-bearing design decisions — do not change without understanding 
   `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` in `sensorServer/.env`, then restarting both services.
 
 - **Sensor registry:** a `Sensor` Mongoose model (`backend/src/lib/models/sensor.ts`) stores
-  `{ id, name, location, encryptedSecretKey, active, registeredAt }`. Use `backend/scripts/seedSensors.ts`
-  (run once: `npx ts-node scripts/seedSensors.ts`) to encrypt and insert all 10 sensor documents — requires
-  `MASTER_KEY` and `MONGO_URI` in `backend/.env`. The in-memory cache built at startup is the auth source
-  of truth during runtime; the DB is not queried per message.
+  `{ id, name, location, encryptedSecretKey, active, registeredAt }`. Documents must be inserted
+  out-of-band (see the one-time setup note in the Backend commands section above). The in-memory
+  cache built at startup is the auth source of truth during runtime; the DB is not queried per message.
 
 - **Timestamp drift simulation:** `sensorServer` applies an independent random jitter of ±`MAX_DRIFT_MS` to
   each sensor's timestamp before publishing. All 5 readings in a tick share the same underlying physics

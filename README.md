@@ -125,7 +125,6 @@ ecoShield/
 │   │           ├── flaggedEvent.ts
 │   │           └── sensor.ts   # Sensor registry (AES-256 encrypted keys)
 │   ├── scripts/
-│   │   ├── seedSensors.ts      # One-time: encrypt + upsert 10 sensor docs
 │   │   └── clearDetections.ts  # Utility: wipe all flagged events
 │   ├── docker-compose.yml      # MongoDB + Redis + RabbitMQ
 │   └── package.json
@@ -195,14 +194,15 @@ Create the required `.env` files before starting any service (see [Environment V
 
 ### 4. Seed the Sensor Registry (one-time)
 
-After configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, run:
+After configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, insert the 10 `Sensor` documents into MongoDB manually or via a private out-of-band script. Each document must have:
 
-```bash
-cd backend
-npx ts-node scripts/seedSensors.ts
+```json
+{ "id": "<uuid>", "name": "Sensor N", "location": "locationA | locationB", "encryptedSecretKey": "<iv_hex>:<ciphertext_hex>", "active": true }
 ```
 
-This encrypts each sensor secret key and upserts 10 `Sensor` documents into MongoDB. Only needs to be run once (or after rotating sensor keys).
+Encrypt each `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` with AES-256-CBC using `MASTER_KEY` (format: `<iv_hex>:<ciphertext_hex>`). See `decryptKey()` in `backend/src/lib/pipeline.ts` for the exact format.
+
+> **Note:** `backend/scripts/seedSensors.ts` has been removed because it embedded all 10 plaintext sensor secret keys in source code. If you have a copy of the repository from before this change, rotate all sensor keys.
 
 ### 5. Start the Detection Model API
 
@@ -290,7 +290,7 @@ LOCATION_B_SENSOR_9_SECRET_KEY=<secret>
 LOCATION_B_SENSOR_10_SECRET_KEY=<secret>
 ```
 
-> Each `*_SECRET_KEY` is the plaintext shared secret used to sign JWTs for that sensor. These must match the values encrypted and stored in MongoDB via `seedSensors.ts`.
+> Each `*_SECRET_KEY` is the plaintext shared secret used to sign JWTs for that sensor. These must match the values encrypted and stored in MongoDB (see step 4 above).
 
 **`frontend/.env.local`**:
 ```env

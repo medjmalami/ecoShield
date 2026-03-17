@@ -32,26 +32,9 @@ const BUFFER_SIZE     = 5;           // complete buckets needed to fire the pipe
 const SENSOR_COUNT    = 5;           // sensors per location
 const LOCATIONS       = ["locationA", "locationB"] as const;
 
-// Sensor UUIDs grouped by location — used for deadline imputation.
-// Keep in sync with:
-//   • sensorServer/src/index.ts → LOCATION_A_SENSOR_IDS / LOCATION_B_SENSOR_IDS
-//   • backend/scripts/seedSensors.ts → SENSORS array
-const LOCATION_SENSOR_IDS: Record<string, string[]> = {
-  locationA: [
-    "2bf2a35c-b0b3-4f5e-b344-e63334b5ea21",
-    "0b92e342-c8f7-44a0-bedc-78554cc555cf",
-    "cfb4fee6-d20b-4d30-9e7f-b450b2e41f2c",
-    "4b5a031a-f16a-4615-9179-fede2cdd0d57",
-    "64d5be9f-5cff-41f3-9a99-904bdf4ccbcb",
-  ],
-  locationB: [
-    "9bbc9a74-ca06-4873-8780-839f42f676f7",
-    "9d39c885-da96-446f-a3ad-de8ce0a42778",
-    "47066d75-1f30-4921-b531-2be485580dd3",
-    "5d89f0a6-0dae-4db8-b929-40c5c51a8ced",
-    "e79c6baf-9828-461b-b148-670dfc1aadc4",
-  ],
-};
+// Reconnection backoff: starts at 1 s, doubles each attempt, caps at 30 s.
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS  = 30_000;
 
 // Feature order used during model training (shared by both optimizer and detection)
 const MODEL_FEATURES: (keyof sensorDataBatch)[] = [
@@ -65,6 +48,10 @@ const sensorSecretKeys = new Map<string, string>();
 
 // sensorId → location string (populated at startup from MongoDB)
 const sensorLocation = new Map<string, string>();
+
+// location → sorted sensorId[] (derived from sensorLocation after loadSensorKeys()).
+// Used by onDeadline() for imputation. Built once; never hard-coded.
+const locationSensorIds = new Map<string, string[]>();
 
 // deadline timers keyed by "<location>:<bucket_ms>" composite string
 const deadlineTimers = new Map<string, NodeJS.Timeout>();
@@ -96,6 +83,9 @@ function decryptKey(encryptedSecretKey: string): string {
 }
 
 // ── Sensor key loading (runs once at startup) ─────────────────────────────────
+// Populates sensorSecretKeys, sensorLocation, and locationSensorIds.
+// locationSensorIds is derived from sensorLocation so sensor UUIDs are never
+// duplicated — MongoDB is the single source of truth.
 
 async function loadSensorKeys(): Promise<void> {
   const sensors = await Sensor.find({ active: true });
@@ -113,10 +103,22 @@ async function loadSensorKeys(): Promise<void> {
       process.exit(1);
     }
   }
+
+  // Build location → sensorId[] map from the loaded sensorLocation entries.
+  // IDs are sorted lexicographically so the order matches assembleAndPushBatch()
+  // and buildModelPayload() — all three sort by id ascending.
+  for (const [sensorId, loc] of sensorLocation) {
+    if (!locationSensorIds.has(loc)) locationSensorIds.set(loc, []);
+    locationSensorIds.get(loc)!.push(sensorId);
+  }
+  for (const [loc, ids] of locationSensorIds) {
+    ids.sort((a, b) => a.localeCompare(b));
+    console.log(`[pipeline] location "${loc}" — ${ids.length} sensor(s): [${ids.join(", ")}]`);
+  }
+
   console.log(
     `[pipeline] loaded secret keys for ${sensorSecretKeys.size} sensor(s) ` +
-    `across ${new Set(sensorLocation.values()).size} location(s): ` +
-    `[${[...sensorLocation.entries()].map(([id, loc]) => `${id}→${loc}`).join(", ")}]`
+    `across ${locationSensorIds.size} location(s)`
   );
 }
 
@@ -216,11 +218,12 @@ async function onDeadline(location: string, bucket: number): Promise<void> {
     `[pipeline] deadline fired for ${location} bucket ${bucket} — ${present}/${SENSOR_COUNT} sensors present`
   );
 
-  const sensorIds = LOCATION_SENSOR_IDS[location];
+  // Use the MongoDB-derived sensor list — no hard-coded UUIDs
+  const sensorIds = locationSensorIds.get(location);
   if (!sensorIds) {
     console.error(
       `[pipeline] onDeadline: unknown location "${location}" — ` +
-      `known: [${Object.keys(LOCATION_SENSOR_IDS).join(", ")}]. Dropping bucket ${bucket}.`
+      `known: [${[...locationSensorIds.keys()].join(", ")}]. Dropping bucket ${bucket}.`
     );
     await redis.del(bucketKey);
     return;
@@ -349,7 +352,7 @@ async function tryRunPipeline(location: string): Promise<void> {
     }
 
     // 7. Build and emit SSE event — last sensor in the group for pump_power reference
-    const lastGroup       = groups[BUFFER_SIZE - 1];
+    const lastGroup         = groups[BUFFER_SIZE - 1];
     const lastSensorReading = lastGroup[lastGroup.length - 1]; // highest id in this location
 
     const event: PipelineEvent = {
@@ -421,51 +424,20 @@ async function storeFlaggedEvent(
   });
 }
 
-// ── RabbitMQ consumer — entry point called from index.ts ──────────────────────
+// ── AMQP consumer setup ───────────────────────────────────────────────────────
+// Called on every successful (re)connect. Asserts the exchange + queue,
+// sets prefetch, and registers the message handler.
 
-export async function startConsumer(): Promise<void> {
-  // Clear stale lists from any previous session (one per location).
-  for (const loc of LOCATIONS) {
-    await redis.del(`sensor:ticks:complete:${loc}`);
-  }
-  console.log("[pipeline] cleared stale sensor:ticks:complete:* lists on startup");
+async function setupConsumer(channel: amqp.Channel): Promise<void> {
+  await channel.assertExchange(EXCHANGE_NAME, "topic", { durable: true });
+  await channel.assertQueue(QUEUE_NAME, { durable: true });
+  await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, BINDING_PATTERN);
+  channel.prefetch(1);
 
-  // Clear stale sensor:last:* keys — they may carry old location strings from a
-  // previous schema (e.g. "Water Treatment Plant") that would cause onDeadline to crash.
-  const lastKeys = await redis.keys("sensor:last:*");
-  if (lastKeys.length > 0) {
-    await redis.del(...lastKeys);
-    console.log(`[pipeline] cleared ${lastKeys.length} stale sensor:last:* key(s) on startup`);
-  }
-
-  // Load and decrypt sensor secret keys + location mapping from MongoDB
-  await loadSensorKeys();
-
-  let connection: amqp.ChannelModel;
-  let channel: amqp.Channel;
-
-  try {
-    connection = await amqp.connect(RABBITMQ_URI);
-    channel    = await connection.createChannel();
-
-    // Assert the durable topic exchange (same declaration as sensorServer)
-    await channel.assertExchange(EXCHANGE_NAME, "topic", { durable: true });
-
-    // Assert the durable queue and bind it to the exchange — sensor.# matches sensor.<uuid> routing keys
-    await channel.assertQueue(QUEUE_NAME, { durable: true });
-    await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, BINDING_PATTERN);
-
-    // Process one message at a time
-    channel.prefetch(1);
-
-    console.log(
-      `[pipeline] connected to RabbitMQ — consuming from queue "${QUEUE_NAME}" ` +
-      `(exchange="${EXCHANGE_NAME}", binding="${BINDING_PATTERN}")`
-    );
-  } catch (err: any) {
-    console.error("[pipeline] failed to connect to RabbitMQ:", err?.message ?? err);
-    process.exit(1);
-  }
+  console.log(
+    `[pipeline] consuming from queue "${QUEUE_NAME}" ` +
+    `(exchange="${EXCHANGE_NAME}", binding="${BINDING_PATTERN}")`
+  );
 
   channel.consume(QUEUE_NAME, async (msg) => {
     if (!msg) return;
@@ -501,4 +473,77 @@ export async function startConsumer(): Promise<void> {
       channel.nack(msg, false, false);
     }
   });
+}
+
+// ── AMQP connection + reconnection loop ───────────────────────────────────────
+// On any error or unexpected close, schedules a reconnect with exponential
+// backoff (1 s → 2 s → … → 30 s). In-memory state (sensorSecretKeys,
+// sensorLocation, locationSensorIds) is loaded once at startup and is not
+// affected by reconnects — the broker holds no auth state.
+
+async function connectAndConsume(attempt: number): Promise<void> {
+  const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, attempt - 1), RECONNECT_MAX_MS);
+
+  try {
+    const connection = await amqp.connect(RABBITMQ_URI);
+    const channel    = await connection.createChannel();
+
+    console.log(`[pipeline] connected to RabbitMQ (attempt ${attempt})`);
+
+    await setupConsumer(channel);
+
+    // On broker-side error or connection drop: reconnect
+    const onLost = (err?: any) => {
+      console.error(
+        "[pipeline] RabbitMQ connection lost:",
+        err?.message ?? "connection closed"
+      );
+      scheduleReconnect(1);
+    };
+
+    connection.on("error", onLost);
+    connection.on("close", onLost);
+  } catch (err: any) {
+    console.error(
+      `[pipeline] RabbitMQ connect failed (attempt ${attempt}), ` +
+      `retrying in ${delay}ms — ${err?.message ?? err}`
+    );
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    await connectAndConsume(attempt + 1);
+  }
+}
+
+function scheduleReconnect(attempt: number): void {
+  const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, attempt - 1), RECONNECT_MAX_MS);
+  console.log(`[pipeline] scheduling reconnect in ${delay}ms (attempt ${attempt})`);
+  setTimeout(
+    () => connectAndConsume(attempt).catch(() => scheduleReconnect(attempt + 1)),
+    delay
+  );
+}
+
+// ── RabbitMQ consumer — entry point called from index.ts ──────────────────────
+
+export async function startConsumer(): Promise<void> {
+  // Clear stale lists from any previous session (one per location).
+  for (const loc of LOCATIONS) {
+    await redis.del(`sensor:ticks:complete:${loc}`);
+  }
+  console.log("[pipeline] cleared stale sensor:ticks:complete:* lists on startup");
+
+  // Clear stale sensor:last:* keys — they may carry old location strings from a
+  // previous schema that would cause onDeadline to crash.
+  const lastKeys = await redis.keys("sensor:last:*");
+  if (lastKeys.length > 0) {
+    await redis.del(...lastKeys);
+    console.log(`[pipeline] cleared ${lastKeys.length} stale sensor:last:* key(s) on startup`);
+  }
+
+  // Load and decrypt sensor secret keys + location mapping from MongoDB.
+  // Also builds locationSensorIds from the loaded data — no hard-coded UUIDs.
+  await loadSensorKeys();
+
+  // Connect to RabbitMQ and start consuming. The reconnect loop handles all
+  // subsequent broker disconnects transparently.
+  await connectAndConsume(1);
 }

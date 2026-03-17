@@ -24,8 +24,13 @@ app.use("/detections", detectionsRouter);
 app.listen(PORT, () => {
   console.log(`[server] running on port ${PORT}`);
 
-  // Start consuming sensor ticks from RabbitMQ
-  startConsumer();
+  // Start consuming sensor ticks from RabbitMQ.
+  // startConsumer() handles its own reconnect loop internally; a rejection here
+  // means the initial Redis flush or MongoDB key-load failed — both unrecoverable.
+  startConsumer().catch((err: any) => {
+    console.error("[server] startConsumer() failed fatally:", err?.message ?? err);
+    process.exit(1);
+  });
 });
 
 export default app;
