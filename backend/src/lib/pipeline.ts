@@ -27,15 +27,30 @@ const BUCKET_DEADLINE_MS = parseInt(process.env.BUCKET_DEADLINE_MS || "8000", 10
 
 const EXCHANGE_NAME   = "sensor.events";
 const QUEUE_NAME      = "sensor.readings";
-const BINDING_PATTERN = "sensor.*";  // matches sensor.1 … sensor.10
+const BINDING_PATTERN = "sensor.#";  // # matches zero or more dot-delimited words — handles UUID routing keys (sensor.<uuid>)
 const BUFFER_SIZE     = 5;           // complete buckets needed to fire the pipeline
 const SENSOR_COUNT    = 5;           // sensors per location
 const LOCATIONS       = ["locationA", "locationB"] as const;
 
-// Sensor IDs grouped by location — used for deadline imputation
+// Sensor UUIDs grouped by location — used for deadline imputation.
+// Keep in sync with:
+//   • sensorServer/src/index.ts → LOCATION_A_SENSOR_IDS / LOCATION_B_SENSOR_IDS
+//   • backend/scripts/seedSensors.ts → SENSORS array
 const LOCATION_SENSOR_IDS: Record<string, string[]> = {
-  locationA: ["1", "2", "3", "4", "5"],
-  locationB: ["6", "7", "8", "9", "10"],
+  locationA: [
+    "2bf2a35c-b0b3-4f5e-b344-e63334b5ea21",
+    "0b92e342-c8f7-44a0-bedc-78554cc555cf",
+    "cfb4fee6-d20b-4d30-9e7f-b450b2e41f2c",
+    "4b5a031a-f16a-4615-9179-fede2cdd0d57",
+    "64d5be9f-5cff-41f3-9a99-904bdf4ccbcb",
+  ],
+  locationB: [
+    "9bbc9a74-ca06-4873-8780-839f42f676f7",
+    "9d39c885-da96-446f-a3ad-de8ce0a42778",
+    "47066d75-1f30-4921-b531-2be485580dd3",
+    "5d89f0a6-0dae-4db8-b929-40c5c51a8ced",
+    "e79c6baf-9828-461b-b148-670dfc1aadc4",
+  ],
 };
 
 // Feature order used during model training (shared by both optimizer and detection)
@@ -45,7 +60,7 @@ const MODEL_FEATURES: (keyof sensorDataBatch)[] = [
 
 // ── In-memory state ───────────────────────────────────────────────────────────
 
-// sensorId → plaintext secret (populated at startup; ids 1–10 are globally unique)
+// sensorId → plaintext secret (populated at startup; UUIDs are globally unique across locations)
 const sensorSecretKeys = new Map<string, string>();
 
 // sensorId → location string (populated at startup from MongoDB)
@@ -155,9 +170,9 @@ async function assembleAndPushBatch(location: string, bucket: number): Promise<v
   // 2. Delete the hash immediately — it is no longer needed
   await redis.del(bucketKey);
 
-  // 3. Sort sensor readings by id ascending (numeric — 1→5 or 6→10)
+  // 3. Sort sensor readings by id ascending (lexicographic — stable across UUID values)
   const readings: sensorData[] = rawReadings.map((v) => JSON.parse(v));
-  const sorted = readings.sort((a, b) => Number(a.id) - Number(b.id));
+  const sorted = readings.sort((a, b) => a.id.localeCompare(b.id));
 
   // 4. Compute pressure_mean and pressure_var across all 5 readings
   const pressures = sorted.map((r) => r.pressure);
@@ -356,11 +371,11 @@ async function tryRunPipeline(location: string): Promise<void> {
 }
 
 // ── Build model payload — shape (5, 30) ──────────────────────────────────────
-// Each row = 5 sensors sorted by id (numeric asc) × 6 features = 30 floats
+// Each row = 5 sensors sorted by id (lexicographic asc) × 6 features = 30 floats
 
 function buildModelPayload(groups: sensorGroup[]): number[][] {
   return groups.map((group) => {
-    const sorted = [...group].sort((a, b) => Number(a.id) - Number(b.id));
+    const sorted = [...group].sort((a, b) => a.id.localeCompare(b.id));
     const row: number[] = [];
     for (const sensor of sorted) {
       for (const feature of MODEL_FEATURES) {
@@ -436,7 +451,7 @@ export async function startConsumer(): Promise<void> {
     // Assert the durable topic exchange (same declaration as sensorServer)
     await channel.assertExchange(EXCHANGE_NAME, "topic", { durable: true });
 
-    // Assert the durable queue and bind it to the exchange — sensor.* matches sensor.1 … sensor.10
+    // Assert the durable queue and bind it to the exchange — sensor.# matches sensor.<uuid> routing keys
     await channel.assertQueue(QUEUE_NAME, { durable: true });
     await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, BINDING_PATTERN);
 

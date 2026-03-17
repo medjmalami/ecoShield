@@ -16,7 +16,7 @@ There is no root-level `package.json`. `frontend/`, `backend/`, and `sensorServe
 
 **Data flow:** `sensorServer` → RabbitMQ topic exchange (`sensor.events`) → `sensor.readings` queue → `backend/pipeline` → Redis bucket buffer → ML models → MongoDB + SSE → `frontend`.
 
-**sensorServer is a single process.** It maintains one shared physics state for all 5 sensors (pressure, flow rate, pump power, reservoir level are physically coupled). Per tick it publishes 5 separate AMQP messages — one per sensor — each with an individually jittered timestamp and its own JWT. This mimics 5 independent sensors on the wire without breaking physics coupling.
+**sensorServer is a single process.** It maintains **two independent physics states** — `stateA` for `locationA` and `stateB` for `locationB` — each with 5 physically coupled sensors (pressure, flow rate, pump power, reservoir level). Per tick it publishes **10 AMQP messages** — 5 per location — each with an individually jittered timestamp and its own JWT. This mimics 10 independent sensors on the wire across 2 locations without breaking per-location physics coupling.
 
 ---
 
@@ -45,12 +45,20 @@ npm start       # Run the compiled JS from dist/index.js
 npx ts-node scripts/seedSensors.ts
 ```
 
-This encrypts each `SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` and upserts 5 `Sensor` documents into MongoDB. Only needs to be run once (or after rotating sensor keys).
+This encrypts each `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` and upserts **10 `Sensor` documents** into MongoDB (5 for `locationA`, 5 for `locationB`, all with UUID `id` fields). It also deletes any legacy sequential-ID documents (`"1"`–`"10"`) left from earlier versions. Only needs to be run once (or after rotating sensor keys).
+
+A second utility script is available for maintenance:
+
+```bash
+npx ts-node scripts/clearDetections.ts
+```
+
+This deletes all `FlaggedEvent` documents from MongoDB. Useful for resetting the anomaly log during development.
 
 ### SensorServer (`sensorServer/` — npm)
 
 ```bash
-npm run dev     # Start the sensor publisher (single process, publishes 5 messages per tick)
+npm run dev     # Start the sensor publisher (single process, publishes 10 messages per tick)
 npm run build   # Compile TypeScript → dist/
 npm start       # Run the compiled JS from dist/index.js
 ```
@@ -92,11 +100,16 @@ docker compose down     # Stop containers
 | `RABBITMQ_URI` | No | `amqp://guest:guest@localhost:5672` | AMQP broker URI |
 | `TICK_INTERVAL_MS` | No | `5000` | Publish interval in ms |
 | `MAX_DRIFT_MS` | No | `2500` | Max random timestamp jitter per sensor per tick (±ms). Must be ≤ `TICK_INTERVAL_MS / 2` |
-| `SENSOR_1_SECRET_KEY` | Yes | — | Plaintext shared secret for sensor 1. Used to sign the JWT on every message for sensor 1 |
-| `SENSOR_2_SECRET_KEY` | Yes | — | Plaintext shared secret for sensor 2 |
-| `SENSOR_3_SECRET_KEY` | Yes | — | Plaintext shared secret for sensor 3 |
-| `SENSOR_4_SECRET_KEY` | Yes | — | Plaintext shared secret for sensor 4 |
-| `SENSOR_5_SECRET_KEY` | Yes | — | Plaintext shared secret for sensor 5 |
+| `LOCATION_A_SENSOR_1_SECRET_KEY` | Yes | — | Plaintext shared secret for locationA sensor 1. Used to sign the JWT on every message for that sensor |
+| `LOCATION_A_SENSOR_2_SECRET_KEY` | Yes | — | Plaintext shared secret for locationA sensor 2 |
+| `LOCATION_A_SENSOR_3_SECRET_KEY` | Yes | — | Plaintext shared secret for locationA sensor 3 |
+| `LOCATION_A_SENSOR_4_SECRET_KEY` | Yes | — | Plaintext shared secret for locationA sensor 4 |
+| `LOCATION_A_SENSOR_5_SECRET_KEY` | Yes | — | Plaintext shared secret for locationA sensor 5 |
+| `LOCATION_B_SENSOR_6_SECRET_KEY` | Yes | — | Plaintext shared secret for locationB sensor 6 |
+| `LOCATION_B_SENSOR_7_SECRET_KEY` | Yes | — | Plaintext shared secret for locationB sensor 7 |
+| `LOCATION_B_SENSOR_8_SECRET_KEY` | Yes | — | Plaintext shared secret for locationB sensor 8 |
+| `LOCATION_B_SENSOR_9_SECRET_KEY` | Yes | — | Plaintext shared secret for locationB sensor 9 |
+| `LOCATION_B_SENSOR_10_SECRET_KEY` | Yes | — | Plaintext shared secret for locationB sensor 10 |
 
 ### `backend/.env`
 
@@ -105,11 +118,20 @@ docker compose down     # Stop containers
 | `PORT` | No | `3001` | Express server port |
 | `RABBITMQ_URI` | No | `amqp://guest:guest@localhost:5672` | AMQP broker URI |
 | `MONGO_URI` | Yes | — | MongoDB connection string |
+| `MONGO_ROOT_USER` | Yes | — | MongoDB root username (used by Docker Compose to initialise the container) |
+| `MONGO_ROOT_PASSWORD` | Yes | — | MongoDB root password (used by Docker Compose) |
+| `MONGO_DB` | Yes | — | MongoDB database name (used by Docker Compose) |
 | `REDIS_URI` | No | `redis://localhost:6379` | Redis connection string |
 | `MASTER_KEY` | Yes | — | 32-byte hex string. AES-256 master key used to encrypt/decrypt sensor secret keys stored in MongoDB. Never stored in the DB. |
 | `DETECTION_API_URL` | No | `http://localhost:8001` | FastAPI detection service URL |
 | `OPTIMIZER_API_URL` | No | `http://localhost:8002` | FastAPI optimizer service URL |
 | `BUCKET_DEADLINE_MS` | No | `8000` | How long to wait for stragglers before closing a time bucket. Must be > `TICK_INTERVAL_MS` and < `2 × TICK_INTERVAL_MS` |
+
+### `frontend/.env.local`
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NEXT_PUBLIC_API_URL` | No | `http://localhost:3001` | Base URL of the Express backend. Used by `frontend/lib/api.ts` for REST and SSE calls |
 
 ---
 
@@ -210,39 +232,37 @@ No Prettier or ESLint config currently exists. Follow these conventions observed
 
 These are load-bearing design decisions — do not change without understanding the implications.
 
-- **Physics simulation state** lives as mutable module-level `let` variables in `sensorServer/src/physics.ts`.
-  All 5 sensors share this state because they are physically coupled — pressure, flow rate, pump power, and
-  reservoir level are interdependent. Do not split this into per-sensor state or move it to a database.
-  `generateSensorData()` still returns all 5 readings per call; the caller publishes them as 5 separate
-  messages with individual timestamp jitter applied after generation.
+- **Physics simulation state** lives as two independent `PhysicsState` instances in `sensorServer/src/physics.ts` — `stateA` for `locationA` and `stateB` for `locationB`. Each state tracks 5 physically coupled sensors (pressure, flow rate, pump power, reservoir level) and must not be merged or shared between locations. `generateSensorData(now, state, sensorIds)` accepts a state object and the UUID array for that location's sensors, and returns all 5 readings per call. `publishTick()` calls `generateSensorData` twice per tick (once per location), then calls `publishGroup()` for each set of 5 readings. Individual timestamp jitter is applied per sensor after generation.
 
 - **FDI attack simulation:** `sensorServer/src/physics.ts` has an 8% per-tick probability of injecting a
   False Data Injection attack (types: `pressure`, `pump_power`, `flow_rate`; duration: 1–3 ticks). This is
   intentional for demo purposes. Attack state is shared across all sensors in the same process.
 
 - **RabbitMQ topology:** `sensorServer` publishes to a durable topic exchange named `sensor.events`. Each
-  sensor reading is published with routing key `sensor.<id>` (e.g. `sensor.1`, `sensor.3`). The backend
-  binds queue `sensor.readings` to this exchange with binding pattern `sensor.*`. Both producer and consumer
+  sensor reading is published with routing key `sensor.<uuid>` (e.g. `sensor.2bf2a35c-b0b3-4f5e-b344-e63334b5ea21`). The backend
+  binds queue `sensor.readings` to this exchange with binding pattern `sensor.#`. Both producer and consumer
   assert the exchange as `type: "topic"` and `durable: true` on startup. Never publish directly to the queue
   by name — always go through the exchange.
 
 - **Sensor authentication (JWT HS256):** every AMQP message carries a short-lived JWT in the message header
-  `x-token`. The JWT is signed with that sensor's individual `SENSOR_<N>_SECRET_KEY` using HS256, contains
+  `x-token`. The JWT is signed with that sensor's individual `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` using HS256, contains
   `{ sensorId: string }`, and has a 1-minute TTL (`expiresIn: "1m"`). A fresh token is generated on every
   publish — tokens are never reused. The backend verifies the token on every message before any processing.
   Expired or invalid tokens result in `nack` (no requeue) and a warning log. A compromised key for one
-  sensor does not affect the other four.
+  sensor does not affect the other nine.
 
-- **Sensor secret key storage:** each sensor's `SENSOR_<N>_SECRET_KEY` is stored AES-256 encrypted in its
+- **Sensor secret key storage:** each sensor's `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` is stored AES-256 encrypted in its
   `Sensor` MongoDB document (`encryptedSecretKey` field). The `MASTER_KEY` in `backend/.env` is the sole
   decryption key — it never touches the database. At `startConsumer()` the backend loads all `Sensor`
-  documents, decrypts each key in memory, and caches the results for the lifetime of the process. Rotate a
-  sensor key by generating a new secret, updating `encryptedSecretKey` in MongoDB and
-  `SENSOR_<N>_SECRET_KEY` in `sensorServer/.env`, then restarting both services.
+  documents, decrypts each key in memory, and caches the results for the lifetime of the process. It also
+  builds a `sensorLocation: Map<string, string>` mapping (`sensorId → location`) from the loaded documents,
+  used to route incoming messages to the correct per-location pipeline. Rotate a sensor key by generating a
+  new secret, updating `encryptedSecretKey` in MongoDB and the corresponding
+  `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` in `sensorServer/.env`, then restarting both services.
 
 - **Sensor registry:** a `Sensor` Mongoose model (`backend/src/lib/models/sensor.ts`) stores
   `{ id, name, location, encryptedSecretKey, active, registeredAt }`. Use `backend/scripts/seedSensors.ts`
-  (run once: `npx ts-node scripts/seedSensors.ts`) to encrypt and insert all 5 sensor documents — requires
+  (run once: `npx ts-node scripts/seedSensors.ts`) to encrypt and insert all 10 sensor documents — requires
   `MASTER_KEY` and `MONGO_URI` in `backend/.env`. The in-memory cache built at startup is the auth source
   of truth during runtime; the DB is not queried per message.
 
@@ -253,30 +273,37 @@ These are load-bearing design decisions — do not change without understanding 
 
 - **Redis bucket buffer:** incoming sensor readings are grouped into time buckets. The incoming timestamp is
   rounded to the nearest `TICK_INTERVAL_MS` boundary:
-  `Math.round(ts / TICK_INTERVAL_MS) * TICK_INTERVAL_MS`. Four Redis structures are used:
-  - `sensor:last:<id>` — Redis String holding the most recent valid reading per sensor. Updated on every
-    successfully authenticated message regardless of bucket state. Used for last-known-value imputation.
-    Never deleted — preserved across backend restarts.
-  - `sensor:tick:<rounded-ts>` — Redis Hash `{ sensorId → sensorData json }`. TTL = `TICK_INTERVAL_MS ×
-    BUFFER_SIZE × 3` (75s, auto-cleans incomplete buckets). Explicitly DEL'd by `assembleAndPushBatch()`
-    immediately after the batch is assembled — it is never read again after that point.
-  - `sensor:closing:<rounded-ts>` — Redis String NX lock (TTL = 30s). Set atomically before assembling a
-    bucket. Prevents double-close races where both `processSensorMessage` (full bucket) and `onDeadline`
-    (deadline fired) attempt to assemble the same bucket concurrently.
-  - `sensor:ticks:complete` — Redis **List** of fully-assembled `sensorGroup` JSON strings (oldest at head,
-    newest at tail). A batch is appended (`RPUSH`) when a bucket closes. The list always holds the last 4
-    complete batches after each pipeline run. DEL'd on backend startup to clear any stale state from the
-    previous session.
+  `Math.round(ts / TICK_INTERVAL_MS) * TICK_INTERVAL_MS`. All Redis keys are scoped per location. Four
+  Redis structures are used per location:
+  - `sensor:last:<location>:<id>` — Redis String holding the most recent valid reading per sensor. Updated
+    on every successfully authenticated message regardless of bucket state. Used for last-known-value
+    imputation. Flushed on backend startup (via `redis.keys("sensor:last:*")` + bulk `del`) to prevent
+    stale key conflicts from before the multi-location refactor.
+  - `sensor:tick:<location>:<rounded-ts>` — Redis Hash `{ sensorId → sensorData json }`. TTL =
+    `TICK_INTERVAL_MS × BUFFER_SIZE × 3` (75s, auto-cleans incomplete buckets). Explicitly DEL'd by
+    `assembleAndPushBatch()` immediately after the batch is assembled — it is never read again after that point.
+  - `sensor:closing:<location>:<rounded-ts>` — Redis String NX lock (TTL = 30s). Set atomically before
+    assembling a bucket. Prevents double-close races where both `processSensorMessage` (full bucket) and
+    `onDeadline` (deadline fired) attempt to assemble the same bucket concurrently.
+  - `sensor:ticks:complete:<location>` — Redis **List** of fully-assembled `sensorGroup` JSON strings
+    (oldest at head, newest at tail). A batch is appended (`RPUSH`) when a bucket closes. The list always
+    holds the last 4 complete batches after each pipeline run. All `sensor:ticks:complete:*` lists are
+    DEL'd on backend startup to clear any stale state from the previous session.
 
 - **Bucket deadline and imputation:** when the first reading for a bucket arrives, a `setTimeout` of
-  `BUCKET_DEADLINE_MS` is registered in the `deadlineTimers: Map<number, NodeJS.Timeout>` in `pipeline.ts`.
-  If all 5 sensors report before the deadline, the timer is cancelled and the bucket is immediately closed.
-  If the deadline fires with fewer than 5 sensors: each missing sensor is substituted with its
-  `sensor:last:<id>` value. `pressure_mean` and `pressure_var` are computed from all 5 sensors in the
-  bucket, including imputed ones. If a sensor has no last-known value (it has never reported since backend
-  startup), the bucket is dropped entirely and a warning is logged — the pipeline does not run for that
-  window. Imputation uses real physics readings from the previous tick, not zeros or synthetic values, so
-  the model input shape `(5, 30)` is always preserved.
+  `BUCKET_DEADLINE_MS` is registered in the `deadlineTimers: Map<string, NodeJS.Timeout>` in `pipeline.ts`,
+  keyed by `"<location>:<bucket_ms>"` composite strings. If all 5 sensors report before the deadline, the
+  timer is cancelled and the bucket is immediately closed. If the deadline fires with fewer than 5 sensors:
+  each missing sensor is substituted with its `sensor:last:<location>:<id>` value. `pressure_mean` and
+  `pressure_var` are computed from all 5 sensors in the bucket, including imputed ones. If a sensor has no
+  last-known value (it has never reported since backend startup), the bucket is dropped entirely and a
+  warning is logged — the pipeline does not run for that window. Imputation uses real physics readings from
+  the previous tick, not zeros or synthetic values, so the model input shape `(5, 30)` is always preserved.
+
+- **Per-location pipeline mutex:** `pipelineRunning: Map<string, boolean>` prevents concurrent pipeline runs
+  for the same location. When the pipeline is triggered for a location, it sets the flag for that location
+  and clears it on completion. The two locations (`locationA`, `locationB`) run their pipelines independently
+  and do not block each other.
 
 - **Pipeline trigger (sliding window):** the pipeline fires when `LLEN("sensor:ticks:complete") = 5`. It
   reads exactly 5 batches via `LRANGE 0 4` (the fully-assembled `sensorGroup` JSON strings — no hash
@@ -285,7 +312,7 @@ These are load-bearing design decisions — do not change without understanding 
   ascending, 6 features each: `pressure, flow_rate, temperature, pump_power, pressure_mean,
   pressure_var`). After the 4-tick warm-up, the pipeline fires on every tick (~5s), producing one SSE
   event per tick to the frontend. `BUFFER_SIZE = 5` complete buckets, `SENSOR_COUNT = 5` sensors per
-  bucket, total model input = 25 readings.
+  bucket, total model input = 25 readings. Each location runs its own independent pipeline.
 
 - **Shared model input shape:** both LSTM models accept exactly `(5 frames × 30 floats)`. The
   `buildModelPayload()` function constructs this. Any model retrain must preserve `SEQ_LEN = 5`,
@@ -294,6 +321,10 @@ These are load-bearing design decisions — do not change without understanding 
 
 - **Parallel ML inference:** detection and optimizer are called via `Promise.all()` — do not make them
   sequential.
+
+- **Detection threshold:** the detection model returns a probability score; `anomaly_detected` is set to
+  `true` when `prob >= 0.9`. This threshold is applied inside `detectionModel/main.py`, not in the backend
+  pipeline. Do not lower this threshold without revalidating false-positive rates on the training dataset.
 
 - **SSE transport:** the backend emits `PipelineEvent` objects via Node.js `EventEmitter`
   (`pipelineEmitter`). SSE route handlers attach/detach listeners on connect/disconnect. Do not replace this
@@ -321,10 +352,27 @@ These are load-bearing design decisions — do not change without understanding 
    training data only. Save new `.pt` and `.pkl` files to `notebooks/` and update the model path constants
    in the corresponding FastAPI `main.py`.
 6. **Registering a new sensor:** generate a random 32-byte hex secret. Encrypt it with `MASTER_KEY` using
-   AES-256. Insert a `Sensor` document in MongoDB: `{ id, name, location, encryptedSecretKey, active: true }`.
-   Add the plaintext key to `sensorServer/.env` as `SENSOR_<N>_SECRET_KEY`. Restart both `sensorServer` and
-   `backend` to pick up the new key.
+   AES-256. Insert a `Sensor` document in MongoDB: `{ id: <uuid>, name, location, encryptedSecretKey, active: true }`.
+   Add the plaintext key to `sensorServer/.env` as `LOCATION_<X>_SENSOR_<N>_SECRET_KEY`. Restart both
+   `sensorServer` and `backend` to pick up the new key — the `sensorLocation` map is rebuilt from MongoDB
+   on every backend startup.
 7. **Changing timing constants:** `BUCKET_DEADLINE_MS` must always satisfy
    `TICK_INTERVAL_MS < BUCKET_DEADLINE_MS < 2 × TICK_INTERVAL_MS`. `MAX_DRIFT_MS` must always satisfy
    `MAX_DRIFT_MS ≤ TICK_INTERVAL_MS / 2`. Violating these invariants causes readings to round into wrong
    buckets or deadlines to fire before all sensors have had a chance to report.
+
+---
+
+## Miscellaneous Notes
+
+- **`frontend/lib/mock-data.ts`:** contains legacy helpers `generateMockData()` and `generateMockAttacks()`
+  that were used during early development. They are not imported by `app/page.tsx` or any other active
+  component. Do not delete — they can be useful for local UI testing — but do not add new dependencies on them.
+
+- **`@vercel/analytics`:** installed as a production dependency and integrated via `<Analytics />` in
+  `frontend/app/layout.tsx`. It is a zero-config, passive analytics collector. No changes are needed unless
+  the deployment target changes from Vercel.
+
+- **`http-proxy-middleware`:** listed in `backend/package.json` dependencies but not imported anywhere in
+  `backend/src/`. It can be removed if it is confirmed to be unneeded, or left as-is until a proxying use
+  case arises.

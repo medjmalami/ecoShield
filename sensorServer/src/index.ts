@@ -12,32 +12,62 @@ const TICK_INTERVAL_MS = parseInt(process.env.TICK_INTERVAL_MS || "5000", 10);
 const MAX_DRIFT_MS     = parseInt(process.env.MAX_DRIFT_MS     || "2500", 10);
 const EXCHANGE_NAME    = "sensor.events";
 
+// ── Sensor UUIDs grouped by location ──────────────────────────────────────────
+// These UUIDs are the canonical sensor identifiers used in AMQP routing keys,
+// JWT payloads, Redis keys, and MongoDB documents. Keep in sync with:
+//   • backend/src/lib/pipeline.ts  → LOCATION_SENSOR_IDS
+//   • backend/scripts/seedSensors.ts → SENSORS array
+
+const LOCATION_A_SENSOR_IDS = [
+  "2bf2a35c-b0b3-4f5e-b344-e63334b5ea21",
+  "0b92e342-c8f7-44a0-bedc-78554cc555cf",
+  "cfb4fee6-d20b-4d30-9e7f-b450b2e41f2c",
+  "4b5a031a-f16a-4615-9179-fede2cdd0d57",
+  "64d5be9f-5cff-41f3-9a99-904bdf4ccbcb",
+];
+
+const LOCATION_B_SENSOR_IDS = [
+  "9bbc9a74-ca06-4873-8780-839f42f676f7",
+  "9d39c885-da96-446f-a3ad-de8ce0a42778",
+  "47066d75-1f30-4921-b531-2be485580dd3",
+  "5d89f0a6-0dae-4db8-b929-40c5c51a8ced",
+  "e79c6baf-9828-461b-b148-670dfc1aadc4",
+];
+
 // ── Load and validate per-sensor secret keys ──────────────────────────────────
-// Sensors 1–5  → locationA
-// Sensors 6–10 → locationB
-// Each sensor has a globally unique id so the flat key map is unambiguous.
+// Positional index 1–5  → locationA sensors (env vars LOCATION_A_SENSOR_1_SECRET_KEY…5)
+// Positional index 1–5  → locationB sensors (env vars LOCATION_B_SENSOR_1_SECRET_KEY…5)
+// Each UUID maps to its secret key via these positional env vars.
 
 const SENSOR_SECRET_KEYS: Record<string, string> = {
-  "1":  process.env.LOCATION_A_SENSOR_1_SECRET_KEY  ?? "",
-  "2":  process.env.LOCATION_A_SENSOR_2_SECRET_KEY  ?? "",
-  "3":  process.env.LOCATION_A_SENSOR_3_SECRET_KEY  ?? "",
-  "4":  process.env.LOCATION_A_SENSOR_4_SECRET_KEY  ?? "",
-  "5":  process.env.LOCATION_A_SENSOR_5_SECRET_KEY  ?? "",
-  "6":  process.env.LOCATION_B_SENSOR_6_SECRET_KEY  ?? "",
-  "7":  process.env.LOCATION_B_SENSOR_7_SECRET_KEY  ?? "",
-  "8":  process.env.LOCATION_B_SENSOR_8_SECRET_KEY  ?? "",
-  "9":  process.env.LOCATION_B_SENSOR_9_SECRET_KEY  ?? "",
-  "10": process.env.LOCATION_B_SENSOR_10_SECRET_KEY ?? "",
+  [LOCATION_A_SENSOR_IDS[0]]: process.env.LOCATION_A_SENSOR_1_SECRET_KEY ?? "",
+  [LOCATION_A_SENSOR_IDS[1]]: process.env.LOCATION_A_SENSOR_2_SECRET_KEY ?? "",
+  [LOCATION_A_SENSOR_IDS[2]]: process.env.LOCATION_A_SENSOR_3_SECRET_KEY ?? "",
+  [LOCATION_A_SENSOR_IDS[3]]: process.env.LOCATION_A_SENSOR_4_SECRET_KEY ?? "",
+  [LOCATION_A_SENSOR_IDS[4]]: process.env.LOCATION_A_SENSOR_5_SECRET_KEY ?? "",
+  [LOCATION_B_SENSOR_IDS[0]]: process.env.LOCATION_B_SENSOR_6_SECRET_KEY ?? "",
+  [LOCATION_B_SENSOR_IDS[1]]: process.env.LOCATION_B_SENSOR_7_SECRET_KEY ?? "",
+  [LOCATION_B_SENSOR_IDS[2]]: process.env.LOCATION_B_SENSOR_8_SECRET_KEY ?? "",
+  [LOCATION_B_SENSOR_IDS[3]]: process.env.LOCATION_B_SENSOR_9_SECRET_KEY ?? "",
+  [LOCATION_B_SENSOR_IDS[4]]: process.env.LOCATION_B_SENSOR_10_SECRET_KEY ?? "",
+};
+
+const SENSOR_ENV_NAMES: Record<string, string> = {
+  [LOCATION_A_SENSOR_IDS[0]]: "LOCATION_A_SENSOR_1_SECRET_KEY",
+  [LOCATION_A_SENSOR_IDS[1]]: "LOCATION_A_SENSOR_2_SECRET_KEY",
+  [LOCATION_A_SENSOR_IDS[2]]: "LOCATION_A_SENSOR_3_SECRET_KEY",
+  [LOCATION_A_SENSOR_IDS[3]]: "LOCATION_A_SENSOR_4_SECRET_KEY",
+  [LOCATION_A_SENSOR_IDS[4]]: "LOCATION_A_SENSOR_5_SECRET_KEY",
+  [LOCATION_B_SENSOR_IDS[0]]: "LOCATION_B_SENSOR_6_SECRET_KEY",
+  [LOCATION_B_SENSOR_IDS[1]]: "LOCATION_B_SENSOR_7_SECRET_KEY",
+  [LOCATION_B_SENSOR_IDS[2]]: "LOCATION_B_SENSOR_8_SECRET_KEY",
+  [LOCATION_B_SENSOR_IDS[3]]: "LOCATION_B_SENSOR_9_SECRET_KEY",
+  [LOCATION_B_SENSOR_IDS[4]]: "LOCATION_B_SENSOR_10_SECRET_KEY",
 };
 
 const missingSensorKeys = Object.entries(SENSOR_SECRET_KEYS)
   .filter(([, v]) => !v)
-  .map(([k]) => {
-    const num = Number(k);
-    return num <= 5
-      ? `LOCATION_A_SENSOR_${k}_SECRET_KEY`
-      : `LOCATION_B_SENSOR_${k}_SECRET_KEY`;
-  });
+  .map(([k]) => SENSOR_ENV_NAMES[k] ?? k);
 
 if (missingSensorKeys.length > 0) {
   console.error(
@@ -48,8 +78,8 @@ if (missingSensorKeys.length > 0) {
 
 // ── Physics state — one independent instance per location ─────────────────────
 
-const stateA = createPhysicsState(); // locationA — sensors 1–5
-const stateB = createPhysicsState(); // locationB — sensors 6–10
+const stateA = createPhysicsState(); // locationA — sensors 1–5 (positional)
+const stateB = createPhysicsState(); // locationB — sensors 6–10 (positional)
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -112,12 +142,12 @@ async function start(): Promise<void> {
       const baseTs   = new Date();
       const baseTsMs = baseTs.getTime();
 
-      // locationA: sensors 1–5 (sensorIdOffset=0)
-      const readingsA = generateSensorData(baseTs, stateA, 0);
+      // locationA: sensors with UUIDs LOCATION_A_SENSOR_IDS[0..4]
+      const readingsA = generateSensorData(baseTs, stateA, LOCATION_A_SENSOR_IDS);
       publishGroup(readingsA, baseTsMs);
 
-      // locationB: sensors 6–10 (sensorIdOffset=5)
-      const readingsB = generateSensorData(baseTs, stateB, 5);
+      // locationB: sensors with UUIDs LOCATION_B_SENSOR_IDS[0..4]
+      const readingsB = generateSensorData(baseTs, stateB, LOCATION_B_SENSOR_IDS);
       publishGroup(readingsB, baseTsMs);
 
       console.log(`[sensor-server] tick published — base=${baseTs.toISOString()} (10 messages)`);

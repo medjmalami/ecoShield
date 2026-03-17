@@ -51,11 +51,10 @@ function demandProfile(hourFloat: number): number {
 }
 
 // ── Generate 5 sensorData objects using physics model ────────────────────────
-// `now`           — shared physics base time for this tick, supplied by the caller.
-// `state`         — mutable physics state for this location (mutated in-place).
-// `sensorIdOffset`— added to (i+1) to produce globally-unique sensor ids:
-//                   0 for locationA → ids "1"–"5"
-//                   5 for locationB → ids "6"–"10"
+// `now`       — shared physics base time for this tick, supplied by the caller.
+// `state`     — mutable physics state for this location (mutated in-place).
+// `sensorIds` — array of 5 UUID strings for this location, in positional order.
+//               The i-th element becomes the id of the i-th sensor reading.
 //
 // The caller is responsible for stamping each reading's .timestamp individually
 // (with per-sensor jitter applied after this function returns).
@@ -63,7 +62,7 @@ function demandProfile(hourFloat: number): number {
 export function generateSensorData(
   now: Date,
   state: PhysicsState,
-  sensorIdOffset: number
+  sensorIds: string[]
 ): sensorData[] {
   // ── Time features ───────────────────────────────────────────────────────────
   const hourFloat = now.getHours() + now.getMinutes() / 60 + now.getSeconds() / 3600;
@@ -166,7 +165,7 @@ export function generateSensorData(
       };
     }
     console.log(
-      `[physics] FDI attack injected (offset=${sensorIdOffset}): ${type} for ${duration} tick(s)`
+      `[physics] FDI attack injected (location=${sensorIds[0]}…): ${type} for ${duration} tick(s)`
     );
   }
 
@@ -188,7 +187,7 @@ export function generateSensorData(
     }
 
     return {
-      id:          String(i + 1 + sensorIdOffset), // globally unique: 1-5 or 6-10
+      id:          sensorIds[i],  // UUID for this sensor position in the location group
       timestamp:   "",  // caller stamps each sensor individually with per-sensor jitter
       pressure:    parseFloat(pressure.toFixed(6)),
       flow_rate:   parseFloat(flowRate.toFixed(6)),
