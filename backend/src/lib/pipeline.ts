@@ -27,10 +27,31 @@ const BUCKET_DEADLINE_MS = parseInt(process.env.BUCKET_DEADLINE_MS || "8000", 10
 
 const EXCHANGE_NAME   = "sensor.events";
 const QUEUE_NAME      = "sensor.readings";
-const BINDING_PATTERN = "sensor.*";
-const BUFFER_SIZE     = 5;  // number of complete batches needed to fire the pipeline
-const SENSOR_COUNT    = 5;
-const SENSOR_IDS      = ["1", "2", "3", "4", "5"] as const;
+const BINDING_PATTERN = "sensor.#";  // # matches zero or more dot-delimited words — handles UUID routing keys (sensor.<uuid>)
+const BUFFER_SIZE     = 5;           // complete buckets needed to fire the pipeline
+const SENSOR_COUNT    = 5;           // sensors per location
+const LOCATIONS       = ["locationA", "locationB"] as const;
+
+// Sensor UUIDs grouped by location — used for deadline imputation.
+// Keep in sync with:
+//   • sensorServer/src/index.ts → LOCATION_A_SENSOR_IDS / LOCATION_B_SENSOR_IDS
+//   • backend/scripts/seedSensors.ts → SENSORS array
+const LOCATION_SENSOR_IDS: Record<string, string[]> = {
+  locationA: [
+    "2bf2a35c-b0b3-4f5e-b344-e63334b5ea21",
+    "0b92e342-c8f7-44a0-bedc-78554cc555cf",
+    "cfb4fee6-d20b-4d30-9e7f-b450b2e41f2c",
+    "4b5a031a-f16a-4615-9179-fede2cdd0d57",
+    "64d5be9f-5cff-41f3-9a99-904bdf4ccbcb",
+  ],
+  locationB: [
+    "9bbc9a74-ca06-4873-8780-839f42f676f7",
+    "9d39c885-da96-446f-a3ad-de8ce0a42778",
+    "47066d75-1f30-4921-b531-2be485580dd3",
+    "5d89f0a6-0dae-4db8-b929-40c5c51a8ced",
+    "e79c6baf-9828-461b-b148-670dfc1aadc4",
+  ],
+};
 
 // Feature order used during model training (shared by both optimizer and detection)
 const MODEL_FEATURES: (keyof sensorDataBatch)[] = [
@@ -39,16 +60,21 @@ const MODEL_FEATURES: (keyof sensorDataBatch)[] = [
 
 // ── In-memory state ───────────────────────────────────────────────────────────
 
-// sensorId → plaintext secret (populated at startup from MongoDB, decrypted with MASTER_KEY)
+// sensorId → plaintext secret (populated at startup; UUIDs are globally unique across locations)
 const sensorSecretKeys = new Map<string, string>();
 
-// bucket timestamp (ms) → active deadline NodeJS.Timeout
-const deadlineTimers = new Map<number, NodeJS.Timeout>();
+// sensorId → location string (populated at startup from MongoDB)
+const sensorLocation = new Map<string, string>();
 
-// Mutex — prevents tryRunPipeline() from executing concurrently with itself.
-// Node.js is single-threaded so a boolean flag is sufficient: the check+set
-// happens synchronously before the first await, making it race-free.
-let pipelineRunning = false;
+// deadline timers keyed by "<location>:<bucket_ms>" composite string
+const deadlineTimers = new Map<string, NodeJS.Timeout>();
+
+// Per-location pipeline mutex — Node.js is single-threaded so a boolean flag is
+// sufficient: the check+set happens synchronously before the first await.
+const pipelineRunning = new Map<string, boolean>([
+  ["locationA", false],
+  ["locationB", false],
+]);
 
 // ── Crypto — AES-256-CBC decrypt ─────────────────────────────────────────────
 // encryptedSecretKey format stored in MongoDB: "<iv_hex>:<ciphertext_hex>"
@@ -81,12 +107,17 @@ async function loadSensorKeys(): Promise<void> {
     try {
       const plaintext = decryptKey(sensor.encryptedSecretKey);
       sensorSecretKeys.set(sensor.id, plaintext);
+      sensorLocation.set(sensor.id, sensor.location);
     } catch (err: any) {
       console.error(`[pipeline] failed to decrypt key for sensor ${sensor.id}:`, err?.message ?? err);
       process.exit(1);
     }
   }
-  console.log(`[pipeline] loaded secret keys for ${sensorSecretKeys.size} sensor(s)`);
+  console.log(
+    `[pipeline] loaded secret keys for ${sensorSecretKeys.size} sensor(s) ` +
+    `across ${new Set(sensorLocation.values()).size} location(s): ` +
+    `[${[...sensorLocation.entries()].map(([id, loc]) => `${id}→${loc}`).join(", ")}]`
+  );
 }
 
 // ── JWT verification ──────────────────────────────────────────────────────────
@@ -104,28 +135,22 @@ function verifyToken(token: string, sensorId: string): boolean {
 
 // ── Redis helpers ─────────────────────────────────────────────────────────────
 
-async function updateLastKnown(reading: sensorData): Promise<void> {
-  await redis.set(`sensor:last:${reading.id}`, JSON.stringify(reading));
-  console.log(`[pipeline] sensor:last:${reading.id} updated`);
+async function updateLastKnown(reading: sensorData, location: string): Promise<void> {
+  await redis.set(`sensor:last:${location}:${reading.id}`, JSON.stringify(reading));
+  console.log(`[pipeline] sensor:last:${location}:${reading.id} updated`);
 }
 
 // ── Bucket: assemble batch, push to list, trigger pipeline ───────────────────
-//
-// This replaces the old closeBucket() + the batch-assembly logic that was
-// previously buried inside tryRunPipeline(). Doing it here means:
-//   • sensor:tick:<bucket> is DEL'd immediately after use (no stale hashes)
-//   • sensor:ticks:complete holds fully-assembled sensorGroup JSON strings
-//   • tryRunPipeline() only reads from the list — no hash lookups at pipeline time
 
-async function assembleAndPushBatch(bucket: number): Promise<void> {
-  const bucketKey  = `sensor:tick:${bucket}`;
-  const closingKey = `sensor:closing:${bucket}`;
+async function assembleAndPushBatch(location: string, bucket: number): Promise<void> {
+  const bucketKey  = `sensor:tick:${location}:${bucket}`;
+  const closingKey = `sensor:closing:${location}:${bucket}`;
 
   // Atomic claim — SET NX ensures only one caller (processSensorMessage or onDeadline)
   // closes a given bucket. The second caller silently exits.
   const claimed = await redis.set(closingKey, "1", "EX", 30, "NX");
   if (!claimed) {
-    console.warn(`[pipeline] bucket ${bucket} already being closed — skipping duplicate`);
+    console.warn(`[pipeline] bucket ${location}:${bucket} already being closed — skipping duplicate`);
     return;
   }
 
@@ -134,9 +159,9 @@ async function assembleAndPushBatch(bucket: number): Promise<void> {
   const rawReadings = Object.values(hash);
 
   if (rawReadings.length !== SENSOR_COUNT) {
-    // Should never happen: we only call this after imputation fills all slots
     console.error(
-      `[pipeline] assembleAndPushBatch: bucket ${bucket} has ${rawReadings.length}/${SENSOR_COUNT} sensors — dropping`
+      `[pipeline] assembleAndPushBatch: bucket ${location}:${bucket} has ` +
+      `${rawReadings.length}/${SENSOR_COUNT} sensors — dropping`
     );
     await redis.del(bucketKey);
     return;
@@ -145,9 +170,9 @@ async function assembleAndPushBatch(bucket: number): Promise<void> {
   // 2. Delete the hash immediately — it is no longer needed
   await redis.del(bucketKey);
 
-  // 3. Sort sensor readings by id ascending (model expects 1→2→3→4→5)
+  // 3. Sort sensor readings by id ascending (lexicographic — stable across UUID values)
   const readings: sensorData[] = rawReadings.map((v) => JSON.parse(v));
-  const sorted = readings.sort((a, b) => Number(a.id) - Number(b.id));
+  const sorted = readings.sort((a, b) => a.id.localeCompare(b.id));
 
   // 4. Compute pressure_mean and pressure_var across all 5 readings
   const pressures = sorted.map((r) => r.pressure);
@@ -166,114 +191,127 @@ async function assembleAndPushBatch(bucket: number): Promise<void> {
     pressure_var:  parseFloat(variance.toFixed(6)),
   })) as sensorGroup;
 
-  // 6. Push the serialized batch onto the right end of the list
-  const llen = await redis.rpush("sensor:ticks:complete", JSON.stringify(group));
+  // 6. Push the serialized batch onto the location's list
+  const listKey = `sensor:ticks:complete:${location}`;
+  const llen    = await redis.rpush(listKey, JSON.stringify(group));
   console.log(
-    `[pipeline] batch assembled for bucket ${bucket} — list length: ${llen}/${BUFFER_SIZE}`
+    `[pipeline] batch assembled for ${location} bucket ${bucket} — list length: ${llen}/${BUFFER_SIZE}`
   );
 
-  // 7. Check if the pipeline should fire
-  await tryRunPipeline();
+  // 7. Check if the pipeline should fire for this location
+  await tryRunPipeline(location);
 }
 
 // ── Bucket: deadline handler — impute missing sensors then assemble ───────────
 
-async function onDeadline(bucket: number): Promise<void> {
-  deadlineTimers.delete(bucket);
+async function onDeadline(location: string, bucket: number): Promise<void> {
+  const timerKey = `${location}:${bucket}`;
+  deadlineTimers.delete(timerKey);
 
-  const existing = await redis.hgetall(`sensor:tick:${bucket}`);
-  const present  = Object.keys(existing).length;
+  const bucketKey = `sensor:tick:${location}:${bucket}`;
+  const existing  = await redis.hgetall(bucketKey);
+  const present   = Object.keys(existing).length;
 
   console.log(
-    `[pipeline] deadline fired for bucket ${bucket} — ${present}/${SENSOR_COUNT} sensors present`
+    `[pipeline] deadline fired for ${location} bucket ${bucket} — ${present}/${SENSOR_COUNT} sensors present`
   );
 
-  for (const sensorId of SENSOR_IDS) {
+  const sensorIds = LOCATION_SENSOR_IDS[location];
+  if (!sensorIds) {
+    console.error(
+      `[pipeline] onDeadline: unknown location "${location}" — ` +
+      `known: [${Object.keys(LOCATION_SENSOR_IDS).join(", ")}]. Dropping bucket ${bucket}.`
+    );
+    await redis.del(bucketKey);
+    return;
+  }
+  for (const sensorId of sensorIds) {
     if (existing[sensorId]) continue;  // already reported
 
-    const lastKnown = await redis.get(`sensor:last:${sensorId}`);
+    const lastKnown = await redis.get(`sensor:last:${location}:${sensorId}`);
     if (!lastKnown) {
       console.warn(
-        `[pipeline] dropping bucket ${bucket} — no last-known value for sensor ${sensorId}`
+        `[pipeline] dropping ${location} bucket ${bucket} — no last-known value for sensor ${sensorId}`
       );
-      await redis.del(`sensor:tick:${bucket}`);
+      await redis.del(bucketKey);
       return;  // cannot impute — drop this bucket
     }
 
-    await redis.hset(`sensor:tick:${bucket}`, sensorId, lastKnown);
-    console.log(`[pipeline] imputed sensor ${sensorId} for bucket ${bucket}`);
+    await redis.hset(bucketKey, sensorId, lastKnown);
+    console.log(`[pipeline] imputed sensor ${sensorId} for ${location} bucket ${bucket}`);
   }
 
-  await assembleAndPushBatch(bucket);
+  await assembleAndPushBatch(location, bucket);
 }
 
 // ── Per-message processing (called after JWT verified) ───────────────────────
 
-async function processSensorMessage(reading: sensorData): Promise<void> {
-  // 1. Always update last-known value for this sensor
-  await updateLastKnown(reading);
+async function processSensorMessage(reading: sensorData, location: string): Promise<void> {
+  // 1. Always update last-known value for this sensor (scoped by location)
+  await updateLastKnown(reading, location);
 
   // 2. Round wire timestamp to nearest bucket boundary
   const ts        = new Date(reading.timestamp).getTime();
   const bucket    = Math.round(ts / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
-  const bucketKey = `sensor:tick:${bucket}`;
+  const bucketKey = `sensor:tick:${location}:${bucket}`;
 
-  console.log(`[pipeline] msg received — sensor ${reading.id}, bucket ${bucket}`);
+  console.log(`[pipeline] msg received — sensor ${reading.id} (${location}), bucket ${bucket}`);
 
-  // 3. Check if this is the first reading for this bucket
+  // 3. Check if this is the first reading for this bucket+location
   const isFirst = (await redis.hlen(bucketKey)) === 0;
 
-  // 4. Store reading in the bucket hash
+  // 4. Store reading in the bucket hash (keyed by sensor id within this location)
   await redis.hset(bucketKey, reading.id, JSON.stringify(reading));
 
   // 5. On first reading: set TTL + start deadline timer
   if (isFirst) {
-    // TTL long enough to outlive BUFFER_SIZE ticks; auto-cleans incomplete buckets
     await redis.pexpire(bucketKey, TICK_INTERVAL_MS * BUFFER_SIZE * 3);
-    const timer = setTimeout(() => onDeadline(bucket), BUCKET_DEADLINE_MS);
-    deadlineTimers.set(bucket, timer);
-    console.log(`[pipeline] new bucket ${bucket} — deadline in ${BUCKET_DEADLINE_MS}ms`);
+    const timerKey = `${location}:${bucket}`;
+    const timer    = setTimeout(() => onDeadline(location, bucket), BUCKET_DEADLINE_MS);
+    deadlineTimers.set(timerKey, timer);
+    console.log(`[pipeline] new ${location} bucket ${bucket} — deadline in ${BUCKET_DEADLINE_MS}ms`);
   }
 
   // 6. Log current fill count
   const hlen = await redis.hlen(bucketKey);
-  console.log(`[pipeline] sensor ${reading.id} → bucket ${bucket} (${hlen}/${SENSOR_COUNT} sensors)`);
+  console.log(
+    `[pipeline] sensor ${reading.id} → ${location} bucket ${bucket} (${hlen}/${SENSOR_COUNT} sensors)`
+  );
 
-  // 7. If all sensors have reported: cancel deadline and assemble immediately
+  // 7. If all 5 sensors for this location have reported: cancel deadline and assemble immediately
   if (hlen === SENSOR_COUNT) {
-    const timer = deadlineTimers.get(bucket);
+    const timerKey = `${location}:${bucket}`;
+    const timer    = deadlineTimers.get(timerKey);
     if (timer) {
       clearTimeout(timer);
-      deadlineTimers.delete(bucket);
+      deadlineTimers.delete(timerKey);
     }
-    console.log(`[pipeline] bucket ${bucket} full — closing immediately`);
-    await assembleAndPushBatch(bucket);
+    console.log(`[pipeline] ${location} bucket ${bucket} full — closing immediately`);
+    await assembleAndPushBatch(location, bucket);
   }
 }
 
-// ── Pipeline trigger — fires when list reaches BUFFER_SIZE ───────────────────
-//
-// Sliding window: the list always holds the last 4 complete batches after a run.
-// On each new tick, a batch is appended (LLEN becomes 5), the pipeline fires,
-// then LPOP removes the oldest — leaving 4 again. Frontend gets an event every tick.
+// ── Pipeline trigger — fires when a location's list reaches BUFFER_SIZE ───────
 
-async function tryRunPipeline(): Promise<void> {
-  if (pipelineRunning) return;
-  pipelineRunning = true;
+async function tryRunPipeline(location: string): Promise<void> {
+  if (pipelineRunning.get(location)) return;
+  pipelineRunning.set(location, true);
 
   try {
+    const listKey = `sensor:ticks:complete:${location}`;
+
     // 1. Check list length
-    const llen = await redis.llen("sensor:ticks:complete");
+    const llen = await redis.llen(listKey);
     if (llen < BUFFER_SIZE) {
-      console.log(`[pipeline] buffer ${llen}/${BUFFER_SIZE} — waiting for more ticks`);
+      console.log(`[pipeline] ${location} buffer ${llen}/${BUFFER_SIZE} — waiting for more ticks`);
       return;
     }
 
     // 2. Read exactly BUFFER_SIZE batches (oldest → newest)
-    const batchStrs = await redis.lrange("sensor:ticks:complete", 0, BUFFER_SIZE - 1);
+    const batchStrs = await redis.lrange(listKey, 0, BUFFER_SIZE - 1);
     if (batchStrs.length !== BUFFER_SIZE) {
       console.error(
-        `[pipeline] expected ${BUFFER_SIZE} batches in list, got ${batchStrs.length} — aborting run`
+        `[pipeline] ${location}: expected ${BUFFER_SIZE} batches in list, got ${batchStrs.length} — aborting run`
       );
       return;
     }
@@ -281,16 +319,16 @@ async function tryRunPipeline(): Promise<void> {
 
     const ts0 = groups[0][0].timestamp;
     const ts4 = groups[BUFFER_SIZE - 1][0].timestamp;
-    console.log(`[pipeline] running pipeline — window: ${ts0} → ${ts4}`);
+    console.log(`[pipeline] running pipeline for ${location} — window: ${ts0} → ${ts4}`);
 
     // 3. Pop the oldest batch to slide the window (list goes back to 4)
-    await redis.lpop("sensor:ticks:complete");
-    console.log(`[pipeline] oldest batch popped — list length now ${BUFFER_SIZE - 1}`);
+    await redis.lpop(listKey);
+    console.log(`[pipeline] ${location} oldest batch popped — list length now ${BUFFER_SIZE - 1}`);
 
     // 4. Build (5, 30) model payload
     const modelPayload = buildModelPayload(groups);
     console.log(
-      `[pipeline] payload shape: ${modelPayload.length} rows × ${modelPayload[0]?.length ?? 0} floats`
+      `[pipeline] ${location} payload shape: ${modelPayload.length} rows × ${modelPayload[0]?.length ?? 0} floats`
     );
 
     // 5. Call both models in parallel
@@ -300,43 +338,44 @@ async function tryRunPipeline(): Promise<void> {
     ]);
 
     console.log(
-      `[pipeline] optimizer → pump_power_optimized: ${optimizerResult.pump_power_optimized} kW` +
+      `[pipeline] ${location} optimizer → pump_power_optimized: ${optimizerResult.pump_power_optimized} kW` +
       ` | detection → anomaly_detected: ${detectionResult.anomaly_detected}`
     );
 
     // 6. Persist flagged anomaly if detected
     if (detectionResult.anomaly_detected) {
-      await storeFlaggedEvent(groups, detectionResult);
-      console.log("[pipeline] anomaly flagged — event stored in MongoDB");
+      await storeFlaggedEvent(location, groups, detectionResult);
+      console.log(`[pipeline] ${location} anomaly flagged — event stored in MongoDB`);
     }
 
-    // 7. Build and emit SSE event
-    const lastGroup      = groups[BUFFER_SIZE - 1];
-    const sensor5Reading = lastGroup.find((r) => r.id === "5");
+    // 7. Build and emit SSE event — last sensor in the group for pump_power reference
+    const lastGroup       = groups[BUFFER_SIZE - 1];
+    const lastSensorReading = lastGroup[lastGroup.length - 1]; // highest id in this location
 
     const event: PipelineEvent = {
       timestamp: ts4,
+      location,
       anomaly: detectionResult.anomaly_detected
         ? { detected: true, sensorWindow: groups as unknown as sensorDataBatch[][] }
         : { detected: false },
-      sensor5:   { pump_power: sensor5Reading?.pump_power ?? 0 },
+      sensor5:   { pump_power: lastSensorReading?.pump_power ?? 0 },
       optimizer: { pump_power_optimized: optimizerResult.pump_power_optimized },
     };
     pipelineEmitter.emit("update", event);
-    console.log(`[pipeline] SSE event emitted — timestamp ${ts4}`);
+    console.log(`[pipeline] SSE event emitted for ${location} — timestamp ${ts4}`);
   } catch (err: any) {
-    console.error("[pipeline] error during pipeline run:", err?.message ?? err);
+    console.error(`[pipeline] error during ${location} pipeline run:`, err?.message ?? err);
   } finally {
-    pipelineRunning = false;
+    pipelineRunning.set(location, false);
   }
 }
 
 // ── Build model payload — shape (5, 30) ──────────────────────────────────────
-// Each row = 5 sensors sorted by id × 6 features = 30 floats
+// Each row = 5 sensors sorted by id (lexicographic asc) × 6 features = 30 floats
 
 function buildModelPayload(groups: sensorGroup[]): number[][] {
   return groups.map((group) => {
-    const sorted = [...group].sort((a, b) => Number(a.id) - Number(b.id));
+    const sorted = [...group].sort((a, b) => a.id.localeCompare(b.id));
     const row: number[] = [];
     for (const sensor of sorted) {
       for (const feature of MODEL_FEATURES) {
@@ -370,11 +409,13 @@ async function callDetection(input: detectionInput): Promise<detectionOutput> {
 // ── MongoDB persistence ───────────────────────────────────────────────────────
 
 async function storeFlaggedEvent(
+  location: string,
   sensorWindow: sensorGroup[],
   detectionResult: detectionOutput
 ): Promise<void> {
   await FlaggedEvent.create({
-    detectedAt:      new Date(),
+    detectedAt: new Date(),
+    location,
     sensorWindow,
     detectionResult,
   });
@@ -383,12 +424,21 @@ async function storeFlaggedEvent(
 // ── RabbitMQ consumer — entry point called from index.ts ──────────────────────
 
 export async function startConsumer(): Promise<void> {
-  // Clear stale list from any previous session.
-  // sensor:last:* keys are intentionally preserved — they are valid imputation sources.
-  await redis.del("sensor:ticks:complete");
-  console.log("[pipeline] cleared stale sensor:ticks:complete on startup");
+  // Clear stale lists from any previous session (one per location).
+  for (const loc of LOCATIONS) {
+    await redis.del(`sensor:ticks:complete:${loc}`);
+  }
+  console.log("[pipeline] cleared stale sensor:ticks:complete:* lists on startup");
 
-  // Load and decrypt sensor secret keys from MongoDB before opening the channel
+  // Clear stale sensor:last:* keys — they may carry old location strings from a
+  // previous schema (e.g. "Water Treatment Plant") that would cause onDeadline to crash.
+  const lastKeys = await redis.keys("sensor:last:*");
+  if (lastKeys.length > 0) {
+    await redis.del(...lastKeys);
+    console.log(`[pipeline] cleared ${lastKeys.length} stale sensor:last:* key(s) on startup`);
+  }
+
+  // Load and decrypt sensor secret keys + location mapping from MongoDB
   await loadSensorKeys();
 
   let connection: amqp.ChannelModel;
@@ -401,7 +451,7 @@ export async function startConsumer(): Promise<void> {
     // Assert the durable topic exchange (same declaration as sensorServer)
     await channel.assertExchange(EXCHANGE_NAME, "topic", { durable: true });
 
-    // Assert the durable queue and bind it to the exchange with sensor.* pattern
+    // Assert the durable queue and bind it to the exchange — sensor.# matches sensor.<uuid> routing keys
     await channel.assertQueue(QUEUE_NAME, { durable: true });
     await channel.bindQueue(QUEUE_NAME, EXCHANGE_NAME, BINDING_PATTERN);
 
@@ -434,7 +484,17 @@ export async function startConsumer(): Promise<void> {
         return;
       }
 
-      await processSensorMessage(body);
+      // Resolve location from the in-memory map (populated from MongoDB at startup)
+      const loc = sensorLocation.get(sensorId);
+      if (!loc) {
+        console.warn(
+          `[pipeline] no location found for sensor ${sensorId} — nack (no requeue)`
+        );
+        channel.nack(msg, false, false);
+        return;
+      }
+
+      await processSensorMessage(body, loc);
       channel.ack(msg);
     } catch (err: any) {
       console.error("[pipeline] error processing message:", err?.message ?? err);

@@ -16,6 +16,7 @@ const sensorDataBatchSchema = new Schema({
 
 const flaggedEventSchema = new Schema({
   detectedAt:      { type: Date, default: Date.now },
+  location:        { type: String, required: true },
   sensorWindow:    { type: [[sensorDataBatchSchema]], required: true }, // 5 groups × 5 readings
   detectionResult: {
     anomaly_detected: { type: Boolean, required: true },
