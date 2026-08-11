@@ -176,7 +176,57 @@ git clone https://github.com/medjmalami/ecoShield.git
 cd ecoShield
 ```
 
-### 2. Start Infrastructure (MongoDB + Redis + RabbitMQ)
+### 2. Configure Environment Variables
+
+Create the required `.env` files before starting any service (see [Environment Variables](#environment-variables) below).
+
+
+### Environment Variables
+
+**`backend/.env`**:
+```env
+PORT=3001
+RABBITMQ_URI=amqp://guest:guest@localhost:5672
+MONGO_URI=mongodb://admin:secret@localhost:27017/ecoshield?authSource=admin
+MONGO_ROOT_USER=admin
+MONGO_ROOT_PASSWORD=secret
+MONGO_DB=ecoshield
+REDIS_URI=redis://localhost:6379
+MASTER_KEY=<32-byte hex string>
+DETECTION_API_URL=http://localhost:8001
+OPTIMIZER_API_URL=http://localhost:8002
+BUCKET_DEADLINE_MS=8000
+```
+
+> `MASTER_KEY` is the AES-256 key used to encrypt sensor secret keys in MongoDB. Generate one with: `openssl rand -hex 32`
+
+**`sensorServer/.env`**:
+```env
+RABBITMQ_URI=amqp://guest:guest@localhost:5672
+TICK_INTERVAL_MS=5000
+MAX_DRIFT_MS=2500
+LOCATION_A_SENSOR_1_SECRET_KEY=<secret>
+LOCATION_A_SENSOR_2_SECRET_KEY=<secret>
+LOCATION_A_SENSOR_3_SECRET_KEY=<secret>
+LOCATION_A_SENSOR_4_SECRET_KEY=<secret>
+LOCATION_A_SENSOR_5_SECRET_KEY=<secret>
+LOCATION_B_SENSOR_6_SECRET_KEY=<secret>
+LOCATION_B_SENSOR_7_SECRET_KEY=<secret>
+LOCATION_B_SENSOR_8_SECRET_KEY=<secret>
+LOCATION_B_SENSOR_9_SECRET_KEY=<secret>
+LOCATION_B_SENSOR_10_SECRET_KEY=<secret>
+```
+
+> Each `*_SECRET_KEY` is the plaintext shared secret used to sign JWTs for that sensor. These must match the values encrypted and stored in MongoDB (see step 4 below).
+
+**`frontend/.env.local`**:
+```env
+NEXT_PUBLIC_API_URL=http://localhost:3001
+```
+
+---
+
+### 3. Start Infrastructure (MongoDB + Redis + RabbitMQ)
 
 ```bash
 cd backend
@@ -188,9 +238,7 @@ This starts:
 - Redis on port `6379`
 - RabbitMQ on port `5672` (management UI at `http://localhost:15672`, default credentials: `guest` / `guest`)
 
-### 3. Configure Environment Variables
 
-Create the required `.env` files before starting any service (see [Environment Variables](#environment-variables) below).
 
 ### 4. Seed the Sensor Registry (one-time)
 
@@ -202,7 +250,7 @@ After configuring `MASTER_KEY` and `MONGO_URI` in `backend/.env`, insert the 10 
 
 Encrypt each `LOCATION_<X>_SENSOR_<N>_SECRET_KEY` from `sensorServer/.env` with AES-256-CBC using `MASTER_KEY` (format: `<iv_hex>:<ciphertext_hex>`). See `decryptKey()` in `backend/src/lib/pipeline.ts` for the exact format.
 
-> **Note:** `backend/scripts/seedSensors.ts` has been removed because it embedded all 10 plaintext sensor secret keys in source code. If you have a copy of the repository from before this change, rotate all sensor keys.
+> **Note:** `backend/scripts/seedSensors.ts` u can use this script to seed the sensor registry with encrypted keys.
 
 ### 5. Start the Detection Model API
 
@@ -254,50 +302,7 @@ pnpm dev
 
 Frontend runs on `http://localhost:3000`
 
-### Environment Variables
 
-**`backend/.env`**:
-```env
-PORT=3001
-RABBITMQ_URI=amqp://guest:guest@localhost:5672
-MONGO_URI=mongodb://admin:secret@localhost:27017/ecoshield?authSource=admin
-MONGO_ROOT_USER=admin
-MONGO_ROOT_PASSWORD=secret
-MONGO_DB=ecoshield
-REDIS_URI=redis://localhost:6379
-MASTER_KEY=<32-byte hex string>
-DETECTION_API_URL=http://localhost:8001
-OPTIMIZER_API_URL=http://localhost:8002
-BUCKET_DEADLINE_MS=8000
-```
-
-> `MASTER_KEY` is the AES-256 key used to encrypt sensor secret keys in MongoDB. Generate one with: `openssl rand -hex 32`
-
-**`sensorServer/.env`**:
-```env
-RABBITMQ_URI=amqp://guest:guest@localhost:5672
-TICK_INTERVAL_MS=5000
-MAX_DRIFT_MS=2500
-LOCATION_A_SENSOR_1_SECRET_KEY=<secret>
-LOCATION_A_SENSOR_2_SECRET_KEY=<secret>
-LOCATION_A_SENSOR_3_SECRET_KEY=<secret>
-LOCATION_A_SENSOR_4_SECRET_KEY=<secret>
-LOCATION_A_SENSOR_5_SECRET_KEY=<secret>
-LOCATION_B_SENSOR_6_SECRET_KEY=<secret>
-LOCATION_B_SENSOR_7_SECRET_KEY=<secret>
-LOCATION_B_SENSOR_8_SECRET_KEY=<secret>
-LOCATION_B_SENSOR_9_SECRET_KEY=<secret>
-LOCATION_B_SENSOR_10_SECRET_KEY=<secret>
-```
-
-> Each `*_SECRET_KEY` is the plaintext shared secret used to sign JWTs for that sensor. These must match the values encrypted and stored in MongoDB (see step 4 above).
-
-**`frontend/.env.local`**:
-```env
-NEXT_PUBLIC_API_URL=http://localhost:3001
-```
-
----
 
 ## API Reference
 

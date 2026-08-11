@@ -1,14 +1,16 @@
 import sys
+from pathlib import Path
+
 import joblib
 import numpy as np
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
-from pathlib import Path
 
 app = FastAPI(title="EcoShield Detection Model")
 
 # ── Model class definition (required for torch.load with full model object) ───
+
 
 class LSTMAnomalyClassifier(nn.Module):
     def __init__(self, input_dim=30, hidden_size=64, num_layers=1, dropout=0.2):
@@ -61,6 +63,7 @@ except Exception as e:
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
 
 @app.get("/health")
 def health():
